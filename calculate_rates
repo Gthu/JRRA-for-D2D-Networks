@@ -1,0 +1,111 @@
+#include "graph.h"
+#include <cmath>
+#include <map>
+#include <set>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+
+/**
+ * @brief Calculates the Shannon capacity rates for all edges using the 3GPP path loss model.
+ * 
+ * @param graph The complete physical network topology.
+ * @param num_nodes Total number of nodes in the graph.
+ * @param active_edges Set of physical links currently carrying traffic.
+ * @param allocated_bandwidths Map of currently allocated bandwidths (MHz) for active links.
+ * @param allocated_powers Map of currently allocated transmission powers (Watts) for active links.
+ * @param noise_psd_dbm_per_mhz Thermal noise power spectral density (dBm/MHz).
+ * @param total_edge_count Total number of edges in the network to calculate potential fractions.
+ * @param total_bandwidth_mhz System-wide maximum spectrum bandwidth.
+ * @param max_node_powers Maximum transmission power hardware limit for each node.
+ * @return LinkMap A map assigning a physical data rate (Mbps) to every valid directed edge.
+ * 
+ * @note Time Complexity: O(V + E).
+ * This function calculates rates for both active and inactive physical links. 
+ * For inactive links, it applies an "Optimistic Estimation" strategy—allocating a fractional 
+ * bandwidth potential and full node power. This guarantees non-zero capacity bounds, 
+ * enabling shortest-path algorithms (like Dijkstra) to dynamically explore and activate 
+ * previously unused routes during the routing optimization phase.
+ */
+LinkMap calculate_rates(
+    const Graph& graph,
+    size_t num_nodes,
+    const std::set<Link>& active_edges,
+    const LinkMap& allocated_bandwidths,
+    const LinkMap& allocated_powers,
+    double noise_psd_dbm_per_mhz,
+    size_t total_edge_count,
+    double total_bandwidth_mhz,
+    const std::vector<double>& max_node_powers
+) {
+    std::cout << "[Physical Layer] Computing 3GPP channel rates for all topological edges...\n";
+
+    // 1. Convert Noise Power Spectral Density from dBm/MHz to Watts/MHz
+    const double noise_w_per_mhz = std::pow(10.0, (noise_psd_dbm_per_mhz - 30.0) / 10.0);
+    
+    // 2. Compute the uniform fractional bandwidth potential for inactive exploration
+    double optimistic_bandwidth_fraction = 1.0 / static_cast<double>(total_edge_count);
+    
+    LinkMap computed_link_rates;
+
+    // 3. Evaluate the physical capacity of every edge in the topology
+    for (size_t u = 0; u < num_nodes; ++u) {
+        if (u >= graph.adj.size()) continue;
+
+        for (const auto& edge : graph.adj[u]) {
+            int v = edge.first;            
+            double distance_meters = edge.second; 
+
+            Link current_link = { static_cast<int>(u), static_cast<int>(v) };
+
+            double bandwidth_mhz = 0.0;
+            double tx_power_watts = 0.0;
+
+            // --- Resource Assessment: Active vs. Inactive Exploration ---
+            if (active_edges.count(current_link)) {
+                // Case A (Active Edge): Utilize actual allocated resources from the optimization state
+                if (allocated_bandwidths.count(current_link)) bandwidth_mhz = allocated_bandwidths.at(current_link);
+                if (allocated_powers.count(current_link)) tx_power_watts = allocated_powers.at(current_link);
+            } else {
+                // Case B (Inactive Edge): Apply Optimistic Estimation
+                // Assign a fractional bandwidth and maximum node power to assess theoretical potential
+                bandwidth_mhz = total_bandwidth_mhz * optimistic_bandwidth_fraction; 
+                
+                if (u < max_node_powers.size()) {
+                    tx_power_watts = max_node_powers[u];
+                } else {
+                    tx_power_watts = 1.0; // Fallback hardware defense
+                }
+            }
+
+            // Numerical stability clamp to prevent log(0) or division by zero
+            bandwidth_mhz = std::max(bandwidth_mhz, 1e-9);
+            tx_power_watts = std::max(tx_power_watts, 1e-9);
+            distance_meters = std::max(distance_meters, 1.0); // Prevent infinite path loss at d=0
+
+            // --- 3GPP Physical Layer Mathematical Model ---
+
+            // (a) Distance conversion and clamping
+            double distance_km = distance_meters / 1000.0;
+            distance_km = std::max(distance_km, 0.001); 
+
+            // (b) 3GPP Path Loss & Channel Gain Evaluation
+            double path_loss_db = 128.1 + 37.6 * std::log10(distance_km);
+            double channel_gain = std::pow(10.0, -path_loss_db / 10.0);
+
+            // (c) Total Noise Power 
+            double total_noise_power = noise_w_per_mhz * bandwidth_mhz;
+
+            // (d) Signal-to-Noise Ratio (SNR)
+            double snr = (tx_power_watts * channel_gain) / total_noise_power;
+
+            // (e) Shannon Capacity Bound (Mbps)
+            double physical_rate_mbps = bandwidth_mhz * std::log2(1.0 + snr);
+
+            computed_link_rates[current_link] = physical_rate_mbps;
+        }
+    }
+
+    std::cout << "  -> Evaluated Shannon capacities for " << computed_link_rates.size() << " topological links.\n";
+    return computed_link_rates;
+}
