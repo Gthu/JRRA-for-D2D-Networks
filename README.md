@@ -10,7 +10,6 @@ This project is built for high-performance scientific computing and relies on th
 
 - Compiler/IDE: Visual Studio 2019 (v142 toolset)
 - Math Library: Eigen3 (specifically <Eigen/Dense>) for high-speed matrix and linear algebra operations
-- Standard Libraries: <chrono>, <iostream>, <stack>, <cstdio>, <cmath>, <iomanip>, <queue> (for BFS connectivity), and <fstream> (for CSV report generation)
 
 ## Core Modules and File Structure
 
