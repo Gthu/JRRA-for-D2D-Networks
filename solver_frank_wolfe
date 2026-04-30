@@ -1,0 +1,489 @@
+#include "graph.h"
+#include <iostream>
+#include <vector>
+#include <map>
+#include <cmath>
+#include <algorithm>
+#include <iomanip>
+#include <limits>
+#include <queue>
+#include <unordered_map>
+#include <set>
+
+/**
+ * @brief Computes the shortest path using a dynamic edge weight map.
+ * 
+ * @param graph The network topology structure.
+ * @param num_nodes Total number of nodes in the network.
+ * @param src Source node index.
+ * @param dst Destination node index.
+ * @param weights Dynamic weight map where keys are directed links and values are marginal costs.
+ * @return std::vector<Link> The sequence of edges forming the shortest path.
+ * 
+ * @note Includes a robustness mechanism: if a physical edge exists but lacks a defined 
+ * weight in the map, it is assigned a heavy penalty (1e9) instead of being treated as disconnected. 
+ * This prevents artificial flow truncations while strongly discouraging its use unless absolutely necessary.
+ */
+std::vector<Link> dijkstra_weighted(
+    const Graph& graph,
+    size_t num_nodes,
+    int src,
+    int dst,
+    const std::map<Link, double>& weights
+) {
+    std::vector<double> dist(num_nodes, std::numeric_limits<double>::max());
+    std::vector<int> parent(num_nodes, -1);
+
+    using PII = std::pair<double, int>;
+    std::priority_queue<PII, std::vector<PII>, std::greater<PII>> pq;
+
+    dist[src] = 0.0;
+    pq.push({ 0.0, src });
+
+    while (!pq.empty()) {
+        double d = pq.top().first;
+        int u = pq.top().second;
+        pq.pop();
+
+        if (d > dist[u]) continue;
+        if (u == dst) break;
+
+        if (u < graph.adj.size()) {
+            for (const auto& edge : graph.adj[u]) {
+                int v = edge.first; 
+                if (v >= num_nodes) continue;
+
+                Link link = { u, v }; 
+                double w;
+
+                if (weights.count(link)) {
+                    w = weights.at(link);
+                } else {
+                    // Fallback penalty for undefined physical links
+                    w = 1e9;
+                }
+
+                if (dist[u] + w < dist[v]) {
+                    dist[v] = dist[u] + w;
+                    parent[v] = u;
+                    pq.push({ dist[v], v });
+                }
+            }
+        }
+    }
+
+    std::vector<Link> path;
+    if (dist[dst] == std::numeric_limits<double>::max()) {
+        return path; 
+    }
+
+    int curr = dst;
+    while (curr != src) {
+        int prev = parent[curr];
+        if (prev == -1) break;
+        path.push_back({ prev, curr });
+        curr = prev;
+    }
+    std::reverse(path.begin(), path.end());
+
+    return path;
+}
+
+/**
+ * @brief Computes Softmax weights using the Log-Sum-Exp trick to prevent numerical overflow.
+ * 
+ * @param T_k Vector of delay values for each commodity.
+ * @param mu The barrier penalty coefficient.
+ * @return std::vector<double> Normalized softmax weights.
+ */
+std::vector<double> calculate_softmax_beta(const std::vector<double>& T_k, double mu) {
+    std::vector<double> beta(T_k.size());
+    if (T_k.empty()) return beta;
+
+    double max_T = *std::max_element(T_k.begin(), T_k.end());
+
+    double sum_exp = 0.0;
+    for (double t : T_k) {
+        sum_exp += std::exp(mu * (t - max_T));
+    }
+
+    for (size_t k = 0; k < T_k.size(); ++k) {
+        beta[k] = std::exp(mu * (T_k[k] - max_T)) / sum_exp;
+    }
+    return beta;
+}
+
+/**
+ * @brief Executes the Frank-Wolfe (FW) algorithm for the routing subproblem.
+ * 
+ * @param graph The network topology.
+ * @param edge_list Tuple list of all edges.
+ * @param num_nodes Total number of nodes.
+ * @param E_active Set of active physical links to be updated.
+ * @param traffic_demands The demand matrix data.
+ * @param r0 Initial or current physical rates of the links.
+ * @param p0 Initial or current power allocations of the links.
+ * @param flow_fractions The routing variables to be optimized.
+ * @param config FW algorithm configuration parameters (mu, alpha, max iterations).
+ * @param dynamic_edge_weights Pre-calculated penalties for blocked or congested edges.
+ * 
+ * @note This function integrates a loop-elimination Flow Decomposition phase (via BFS) 
+ * and ping-pong flow cancellation to ensure the final output is a pure Directed Acyclic Graph (DAG).
+ */
+void solve_frank_wolfe(
+    const Graph& graph,
+    const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
+    size_t num_nodes,
+    std::set<Link>& E_active,
+    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
+    const LinkMap& r0,
+    const LinkMap& p0,
+    std::vector<std::map<Link, double>>& flow_fractions,
+    FWConfig config,
+    const std::map<Link, double>& dynamic_edge_weights
+) {
+    std::cout << "\n>>> Invoke Frank-Wolfe solver (mu=" << config.mu << ", alpha=" << config.alpha << ") <<<" << std::endl;
+
+    if (r0.empty()) {
+        std::cerr << "[Error] Rate map (r0) is empty! FW cannot proceed." << std::endl;
+        return;
+    }
+
+    int iter = 1;
+    double prev_obj_value = std::numeric_limits<double>::max();
+    double min_gap_so_far = std::numeric_limits<double>::max();
+    
+    std::vector<std::map<Link, double>> best_flow_fractions = flow_fractions;
+    double best_obj_val = std::numeric_limits<double>::max();
+    int best_iter_idx = -1; 
+    std::string stop_reason = "Max Iter reached"; 
+
+    while (iter <= config.max_iter) {
+
+        // =========================================================
+        // Step 1: Evaluate Current State & Compute Objective
+        // =========================================================
+        std::vector<double> T_k(traffic_demands.size(), 0.0);
+        double total_energy_term = 0.0; 
+
+        for (size_t k = 0; k < traffic_demands.size(); ++k) {
+            double M_k = std::get<2>(traffic_demands[k]);
+            for (const auto& pair : flow_fractions[k]) {
+                Link link = pair.first;
+                double flow_val = pair.second;
+                if (flow_val < 1e-9) continue;
+
+                double r = (r0.count(link)) ? r0.at(link) : 1e-9;
+                double p = (p0.count(link)) ? p0.at(link) : 0.0;
+                if (r < 1e-9) r = 1e-9;
+
+                T_k[k] += flow_val * (M_k / r);
+                total_energy_term += flow_val * (1.0 - config.alpha) * M_k * (p / r);
+            }
+        }
+        
+        double max_T = T_k.empty() ? 0.0 : *std::max_element(T_k.begin(), T_k.end());
+
+        double sum_exp = 0.0;
+        for (double t : T_k) sum_exp += std::exp(config.mu * (t - max_T));
+        if (sum_exp < 1e-9) sum_exp = 1e-9;
+
+        double obj_val = (config.alpha / config.mu) * (config.mu * max_T + std::log(sum_exp)) + total_energy_term;
+        prev_obj_value = obj_val;
+
+        // =========================================================
+        // Step 2: Find Descent Direction (Shortest Path Subproblem)
+        // =========================================================
+        std::vector<std::map<Link, double>> candidate_flow(traffic_demands.size());
+        std::vector<double> beta_k(traffic_demands.size());
+        std::vector<std::map<Link, double>> derivative_weights(traffic_demands.size());
+
+        for (size_t k = 0; k < traffic_demands.size(); ++k) {
+            beta_k[k] = std::exp(config.mu * (T_k[k] - max_T)) / sum_exp;
+        }
+
+        auto get_link_weight = [&](Link l, double beta, double M_k) -> double {
+            if (dynamic_edge_weights.count(l)) return dynamic_edge_weights.at(l);
+
+            double r = (r0.count(l)) ? r0.at(l) : 1e-9;
+            double p = (p0.count(l)) ? p0.at(l) : 0.0;
+            if (r < 1e-9) r = 1e-9;
+
+            return config.alpha * (beta + config.epsilon) * (M_k / r) + (1.0 - config.alpha) * M_k * (p / r);
+        };
+
+        for (size_t k = 0; k < traffic_demands.size(); ++k) {
+            double M_k = std::get<2>(traffic_demands[k]);
+            size_t src = std::get<0>(traffic_demands[k]);
+            size_t des = std::get<1>(traffic_demands[k]);
+
+            std::map<Link, double>& current_weights = derivative_weights[k]; 
+            for (const auto& edge : edge_list) {
+                int u = static_cast<int>(std::get<0>(edge));
+                int v = static_cast<int>(std::get<1>(edge));
+                Link l = { u, v };
+                current_weights[l] = get_link_weight(l, beta_k[k], M_k);
+            }
+
+            std::vector<Link> path = dijkstra_weighted(graph, num_nodes, (int)src, (int)des, current_weights);
+            if (!path.empty()) {
+                for (const auto& l : path) candidate_flow[k][l] = 1.0;
+            }
+        }
+
+        // =========================================================
+        // Step 3: Curvature Calculation & Dual Gap
+        // =========================================================
+        double numerator_gap = 0.0;
+        double sum_beta_u_sq = 0.0;
+        double sum_beta_u = 0.0;
+        bool valid_path_exists = false;
+
+        std::vector<double> candidate_T(traffic_demands.size(), 0.0);
+        double candidate_energy = 0.0; 
+
+        for (size_t k = 0; k < traffic_demands.size(); ++k) {
+            if (candidate_flow[k].empty()) {
+                candidate_T[k] = 1e15;
+                continue;
+            }
+            valid_path_exists = true;
+            double M_k = std::get<2>(traffic_demands[k]);
+
+            for (const auto& pair : candidate_flow[k]) {
+                Link l = pair.first;
+                double r = (r0.count(l)) ? r0.at(l) : 1e-9;
+                double p = (p0.count(l)) ? p0.at(l) : 0.0;
+                if (r < 1e-9) r = 1e-9;
+
+                candidate_T[k] += (M_k / r);
+                candidate_energy += 1.0 * (1.0 - config.alpha) * M_k * (p / r); 
+            }
+
+            double u_k = candidate_T[k] - T_k[k];
+            sum_beta_u_sq += beta_k[k] * (u_k * u_k);
+            sum_beta_u += beta_k[k] * u_k;
+
+            double cost_x = 0.0;
+            double cost_y = 0.0;
+
+            for (auto& p : flow_fractions[k]) {
+                auto it = derivative_weights[k].find(p.first);
+                if (it != derivative_weights[k].end()) {
+                    cost_x += p.second * it->second;
+                } else {
+                    std::cout << "[Warning] Phantom edge detected (not in edge_list): Node "
+                              << p.first.first << " -> Node " << p.first.second
+                              << " (Flow: " << p.second << ")" << std::endl;
+                    cost_x += p.second * get_link_weight(p.first, beta_k[k], M_k);
+                }
+            }
+
+            for (auto& p : candidate_flow[k]) {
+                auto it = derivative_weights[k].find(p.first);
+                double w = (it != derivative_weights[k].end()) ? it->second : get_link_weight(p.first, beta_k[k], M_k);
+                cost_y += 1.0 * w; 
+            }
+
+            numerator_gap += (cost_x - cost_y);
+        }
+        
+        if (numerator_gap < 0.0) numerator_gap = 0.0; 
+
+        if (!valid_path_exists) {
+            std::cerr << "[Fatal] No valid candidate paths found." << std::endl;
+            break;
+        }
+
+        if (numerator_gap < min_gap_so_far) {
+            min_gap_so_far = numerator_gap;
+            best_obj_val = prev_obj_value;
+            best_flow_fractions = flow_fractions;
+            best_iter_idx = iter; 
+        }
+        
+        if (numerator_gap < config.tolerance) {
+            std::cout << ">>> Algorithm convergence (Gap < Tolerance)." << std::endl;
+            stop_reason = "Satisfying (Gap < Tolerance)"; 
+            break;
+        }
+
+        double variance = sum_beta_u_sq - (sum_beta_u * sum_beta_u);
+        if (variance < 0) variance = 0.0;
+        double C_n = config.alpha * config.mu * variance; 
+
+        // =========================================================
+        // Step 4: Step Size Calculation (Line Search)
+        // =========================================================
+        double optimal_lambda = 1.0;
+
+        if (C_n > 1e-8) {
+            double newton_lambda = numerator_gap / C_n;
+            double max_allowed_lambda = (iter > 15) ? 0.6 : 1.0;
+            optimal_lambda = std::min(max_allowed_lambda, std::max(0.0, newton_lambda));
+        }
+
+        std::cout << "Iter " << iter << " | Gap: " << numerator_gap << " | Lambda: " << optimal_lambda << std::endl;
+
+        if (optimal_lambda < 1e-9 && numerator_gap > 1.0) optimal_lambda = 1e-5;
+
+        // =========================================================
+        // Step 5: State Update 
+        // =========================================================
+        for (size_t k = 0; k < traffic_demands.size(); ++k) {
+            if (candidate_flow[k].empty()) continue;
+
+            for (auto it = flow_fractions[k].begin(); it != flow_fractions[k].end(); ) {
+                it->second *= (1.0 - optimal_lambda);
+                if (it->second < 1e-9) it = flow_fractions[k].erase(it);
+                else ++it;
+            }
+            
+            for (const auto& pair : candidate_flow[k]) {
+                flow_fractions[k][pair.first] += optimal_lambda * pair.second; 
+            }
+        }
+        iter++;
+    } 
+
+    // =========================================================
+    // Final Verification & Flow Decomposition
+    // =========================================================
+    std::cout << "\n========================================================" << std::endl;
+    std::cout << "               Frank-Wolfe Results" << std::endl;
+    std::cout << "========================================================" << std::endl;
+    std::cout << "Stop Reason : " << stop_reason << std::endl;
+    std::cout << "Iteration   : " << iter << " / " << config.max_iter << std::endl;
+
+    double rel_gap = (std::abs(best_obj_val) > 1e-9) ? (min_gap_so_far / std::abs(best_obj_val)) : 1.0;
+
+    std::cout << "Best Result : Iter " << best_iter_idx
+              << " (Gap = " << min_gap_so_far
+              << ", RelGap = " << std::fixed << std::setprecision(3) << rel_gap * 100.0 << "%)" << std::endl;
+    std::cout << "Final Obj   : " << std::defaultfloat << best_obj_val << std::endl;
+    std::cout << "--------------------------------------------------------" << std::endl;
+
+    if (iter - best_iter_idx > 50) {
+        std::cout << "[Note] Best solution obtained at Iter " << best_iter_idx << std::endl;
+        std::cout << "       Subsequent " << (iter - best_iter_idx) << " iterations yielded no improvement." << std::endl;
+    }
+    std::cout << "========================================================" << std::endl;
+    std::cout << ">>> Recovering best solution (Gap = " << min_gap_so_far << ") <<<" << std::endl;
+
+    // Execute Ping-Pong Canceling & BFS Flow Decomposition
+    std::cout << ">>> Executing Flow Decomposition (Loop Removal) <<<" << std::endl;
+
+    for (size_t k = 0; k < traffic_demands.size(); ++k) {
+        int src = (int)std::get<0>(traffic_demands[k]);
+        int des = (int)std::get<1>(traffic_demands[k]);
+
+        std::map<Link, double> cleaned_flow;
+        std::map<Link, double>& raw_flow = best_flow_fractions[k];
+
+        // Ping-Pong Canceling (Bi-directional elimination)
+        for (auto& pair : raw_flow) {
+            int u = pair.first.first;
+            int v = pair.first.second;
+
+            if (u < v && raw_flow.count({ v, u })) {
+                double f1 = pair.second;
+                double f2 = raw_flow[{v, u}];
+
+                if (f1 > f2) {
+                    pair.second = f1 - f2;            
+                    raw_flow[{v, u}] = 0.0;            
+                } else {
+                    raw_flow[{v, u}] = f2 - f1;        
+                    pair.second = 0.0;                 
+                }
+            }
+        }
+
+        double extracted_total = 0.0;
+        double target_flow = 1.0;
+
+        std::unordered_map<int, std::vector<std::pair<int, double>>> adj_list;
+        for (const auto& pair : raw_flow) {
+            if (pair.second > 1e-9) {
+                adj_list[pair.first.first].push_back({ pair.first.second, pair.second });
+            }
+        }
+
+        // Extract clean DAG flows via BFS
+        while (extracted_total < target_flow - 1e-6) {
+            std::set<int> visited;
+            std::map<int, int> parent;
+            std::queue<int> q; 
+
+            q.push(src);
+            visited.insert(src);
+
+            bool found_path = false;
+            while (!q.empty()) {
+                int u = q.front();
+                q.pop();
+
+                if (u == des) {
+                    found_path = true;
+                    break;
+                }
+
+                if (adj_list.find(u) != adj_list.end()) {
+                    for (const auto& out_edge : adj_list[u]) {
+                        int v = out_edge.first;
+                        if (raw_flow[{u, v}] > 1e-9 && visited.find(v) == visited.end()) {
+                            visited.insert(v);
+                            parent[v] = u;
+                            q.push(v);
+                        }
+                    }
+                }
+            }
+
+            if (!found_path) break; 
+
+            int curr = des;
+            std::vector<Link> current_path;
+            double min_flow = 1e9;
+
+            while (curr != src) {
+                int p = parent[curr];
+                Link lk = { p, curr };
+                current_path.push_back(lk);
+                min_flow = std::min(min_flow, raw_flow[lk]);
+                curr = p;
+            }
+
+            double extract_amount = std::min(min_flow, target_flow - extracted_total);
+            if (extract_amount < 1e-12) break;
+
+            for (const auto& lk : current_path) {
+                cleaned_flow[lk] += extract_amount;
+                raw_flow[lk] -= extract_amount;
+            }
+            extracted_total += extract_amount;
+        }
+
+        best_flow_fractions[k] = cleaned_flow; 
+    }
+
+    // Restore clean optimum
+    flow_fractions = best_flow_fractions;
+
+    // Rebuild Active Edge Set
+    E_active.clear();
+    double flow_threshold = 1e-6; 
+
+    for (size_t k = 0; k < traffic_demands.size(); ++k) {
+        for (auto it = flow_fractions[k].begin(); it != flow_fractions[k].end(); ) {
+            if (it->second < flow_threshold) {
+                it = flow_fractions[k].erase(it); 
+            } else {
+                E_active.insert(it->first); 
+                ++it;
+            }
+        }
+    }
+
+    std::cout << "E_active size (Cleaned): " << E_active.size() << std::endl;
+}
