@@ -1,12 +1,361 @@
-#include "graph.h"
-#include <iostream>
-#include <vector>
-#include <map>
-#include <cmath>
-#include <numeric>
-#include <algorithm>
+#include "solver_dual.h"
 #include <functional>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <iostream>
+#include <map>
+#include <numeric>
+#include <queue>
+#include <set>
 
+constexpr double kDualEpsilon = 1e-9;
+
+/**
+ * @brief Projects a dual variable vector onto a simplex manifold.
+ * 
+ * @param input_vector The input vector to be projected (e.g., delay shadow prices).
+ * @param target_sum The target sum of the projected vector elements (alpha tradeoff).
+ * @return std::vector<double> The projected vector satisfying the sum and non-negativity constraints.
+ * 
+ * @note Time Complexity: O(K log K) due to the sorting step, where K is the vector dimension.
+ * Solves the minimization problem: min ||x - y||^2 subject to sum(x) = target_sum, x >= 0.
+ */
+std::vector<double> project_simplex(std::vector<double>& input_vector, double target_sum) {
+    int dimension = static_cast<int>(input_vector.size());
+    if (dimension == 0) return {};
+
+    std::vector<double> sorted_vector = input_vector;
+    std::sort(sorted_vector.begin(), sorted_vector.end(), std::greater<double>());
+
+    int rho = -1;
+    double running_sum = 0.0;
+    for (int i = 0; i < dimension; ++i) {
+        running_sum += sorted_vector[i];
+        double threshold = sorted_vector[i] + (1.0 / (i + 1)) * (target_sum - running_sum);
+        if (threshold > 0) rho = i;
+    }
+
+    double theta = 0.0;
+    double sum_up_to_rho = 0.0;
+    for (int i = 0; i <= rho; ++i) sum_up_to_rho += sorted_vector[i];
+    theta = (1.0 / (rho + 1)) * (target_sum - sum_up_to_rho);
+
+    std::vector<double> projected_vector(dimension);
+    for (int i = 0; i < dimension; ++i) {
+        projected_vector[i] = std::max(0.0, input_vector[i] + theta);
+    }
+    return projected_vector;
+}
+
+/**
+ * @brief Solves the physical link resource allocation subproblem via Coordinate Descent.
+ * 
+ * @param bandwidth_opt [out] Optimized bandwidth allocation for the link.
+ * @param delay_opt [out] Optimized transmission delay for the link.
+ * @param data_demand_mb Total data volume traversing the link.
+ * @param channel_snr_gain Pre-calculated safe SNR gain (h / N0) to prevent division by zero.
+ * @param price_bandwidth Lagrangian dual variable for the system bandwidth constraint.
+ * @param price_power Lagrangian dual variable for the node power constraint.
+ * @param price_delay Lagrangian dual variable for the aggregated delay constraint.
+ * @param max_power_limit Absolute physical hardware ceiling for transmission power.
+ * @param alpha_tradeoff System parameter balancing energy and delay objectives.
+ * @param system_tolerance Numerical tolerance to prevent floating-point underflow.
+ * 
+ * @note Optimizes the Lagrangian function Phi_ij(l, t) iteratively. Implements hard 
+ * power clamping and exponential bounding to prevent numerical overflow in Shannon capacity inversions.
+ */
+void solve_link_subproblem(
+    double& bandwidth_opt, double& delay_opt, 
+    double data_demand_mb, double channel_snr_gain,
+    double price_bandwidth, double price_power, double price_delay,
+    double max_power_limit, double alpha_tradeoff, double system_tolerance
+) {
+    const double kMinVariableThreshold = 1e-3;
+    bandwidth_opt = std::max(bandwidth_opt, kMinVariableThreshold);
+    delay_opt = std::max(delay_opt, kMinVariableThreshold);
+
+    double power_penalty_coeff = system_tolerance + price_power;
+    double energy_weight = 1.0 - alpha_tradeoff;
+    double inverse_snr_gain = 1.0 / channel_snr_gain; 
+
+    // Coordinate descent macro-loop
+    for (int iter = 0; iter < 10; ++iter) {
+
+        // --- Step A: Optimize Bandwidth (delay fixed) ---
+        {
+            double search_low = kMinVariableThreshold, search_high = 50.0;
+            for (int bin = 0; bin < 30; ++bin) {
+                double mid = (search_low + search_high) / 2.0;
+                double current_bandwidth = mid;
+
+                double shannon_exponent = data_demand_mb / (current_bandwidth * delay_opt);
+
+                // Defense 1: Prevent exponent overflow
+                if (shannon_exponent > 50.0) {
+                    search_low = mid; 
+                    continue;
+                }
+
+                double exponential_term = std::pow(2.0, shannon_exponent);
+                double actual_power = current_bandwidth * inverse_snr_gain * (exponential_term - 1.0);
+
+                // Defense 2: Hard physical power clamping
+                if (actual_power > max_power_limit) {
+                    search_low = mid; 
+                    continue;
+                }
+
+                double power_derivative = inverse_snr_gain * (exponential_term - 1.0 - shannon_exponent * std::log(2.0) * exponential_term);
+                double objective_derivative = power_derivative * (energy_weight * delay_opt + power_penalty_coeff) + price_bandwidth;
+
+                if (objective_derivative > 0) search_high = mid;
+                else search_low = mid;
+            }
+            bandwidth_opt = (search_low + search_high) / 2.0;
+        }
+        
+        // --- Step B: Optimize Delay (bandwidth fixed) ---
+        {
+            double kMaxQosDelay = 50.0; 
+
+            double max_achievable_snr = (max_power_limit * channel_snr_gain) / bandwidth_opt;
+            double max_shannon_rate = bandwidth_opt * std::log2(1.0 + max_achievable_snr);
+
+            double absolute_min_delay = (max_shannon_rate > 1e-9) ? (data_demand_mb / max_shannon_rate) : 99999.0;
+
+            double search_low = absolute_min_delay;
+            double search_high = std::max(absolute_min_delay, kMaxQosDelay);
+
+            if (search_high - search_low < 1e-4) {
+                delay_opt = search_high;
+            } else {
+                for (int bin = 0; bin < 35; ++bin) {
+                    double mid = (search_low + search_high) / 2.0;
+                    double current_delay = mid;
+
+                    double shannon_exponent = data_demand_mb / (bandwidth_opt * current_delay);
+                    double exponential_term = std::pow(2.0, shannon_exponent);
+                    double actual_power = bandwidth_opt * inverse_snr_gain * (exponential_term - 1.0);
+
+                    if (actual_power > max_power_limit) {
+                        search_low = mid; 
+                        continue;
+                    }
+
+                    double power_time_derivative = -(inverse_snr_gain * data_demand_mb * std::log(2.0) / (current_delay * current_delay)) * exponential_term;
+                    double energy_time_derivative = inverse_snr_gain * bandwidth_opt * (exponential_term - 1.0 - shannon_exponent * std::log(2.0) * exponential_term);
+                    double objective_derivative = energy_weight * energy_time_derivative + power_penalty_coeff * power_time_derivative + price_delay;
+
+                    if (objective_derivative > 0) search_high = mid;
+                    else search_low = mid;
+                }
+                delay_opt = (search_low + search_high) / 2.0;
+            }
+        }
+    }
+}
+
+/**
+ * @brief Equal Resource Allocation (Baseline) & DAG Longest-Path Evaluation.
+ * 
+ * @param edge_list Tuple list defining the physical topology.
+ * @param traffic_demands Tuple list defining commodity traffic flows.
+ * @param flow_fractions Routing distributions.
+ * @param total_bandwidth_spectrum System-wide spectrum budget.
+ * @param max_power_per_node Max available transmission power per node.
+ * @param noise_power_dbm_per_mhz Noise spectral density.
+ * @return OptimizationResult Structure containing statically allocated resources and topological delays.
+ */
+OptimizationResult run_static_equal_allocation(
+    const std::vector<std::tuple<size_t, size_t, double>>& edge_list, 
+    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
+    const std::vector<std::map<Link, double>>& flow_fractions,
+    double total_bandwidth_spectrum,
+    double max_power_per_node,
+    double noise_power_dbm_per_mhz
+) {
+    OptimizationResult baseline_result;
+
+    std::set<Link> active_edges;
+    std::map<int, int> node_out_degree;
+    
+    for (size_t k = 0; k < traffic_demands.size(); ++k) {
+        for (const auto& pair : flow_fractions[k]) {
+            if (pair.second > 1e-6) {
+                active_edges.insert(pair.first);
+            }
+        }
+    }
+    for (const auto& l : active_edges) {
+        node_out_degree[l.first]++;
+    }
+
+    double equal_bandwidth = active_edges.empty() ? 0.0 : total_bandwidth_spectrum / active_edges.size();
+
+    baseline_result.l_opt.resize(edge_list.size(), 0.0);
+    baseline_result.p_opt.resize(edge_list.size(), 0.0);
+    baseline_result.r_opt.resize(edge_list.size(), 0.0);
+
+    double noise_psd_w_mhz = std::pow(10.0, (noise_power_dbm_per_mhz - 30.0) / 10.0);
+    double total_noise_power = noise_psd_w_mhz * equal_bandwidth;
+
+    for (size_t i = 0; i < edge_list.size(); ++i) {
+        Link current_link = { static_cast<int>(std::get<0>(edge_list[i])), static_cast<int>(std::get<1>(edge_list[i])) };
+
+        if (active_edges.count(current_link)) {
+            double equal_power = max_power_per_node / node_out_degree[current_link.first];
+
+            double distance_meters = std::get<2>(edge_list[i]);
+            double distance_km = std::max(0.001, distance_meters / 1000.0);
+
+            double path_loss_db = 128.1 + 37.6 * std::log10(distance_km);
+            double channel_gain = std::pow(10.0, -path_loss_db / 10.0);
+
+            double shannon_rate = 0.0;
+            if (total_noise_power > 1e-15) {
+                double snr = (equal_power * channel_gain) / total_noise_power;
+                shannon_rate = equal_bandwidth * std::log2(1.0 + snr);
+            }
+
+            baseline_result.l_opt[i] = equal_bandwidth;
+            baseline_result.p_opt[i] = equal_power;
+            baseline_result.r_opt[i] = shannon_rate;
+        }
+    }
+
+    // =========================================================
+    // Topological Delay Evaluation
+    // =========================================================
+    double system_max_delay = 0.0;
+    double system_total_energy = 0.0;
+    std::vector<double> physical_edge_time(edge_list.size(), 0.0);
+    std::vector<double> aggregated_edge_load(edge_list.size(), 0.0);
+
+    for (size_t i = 0; i < edge_list.size(); ++i) {
+        Link current_link = { static_cast<int>(std::get<0>(edge_list[i])), static_cast<int>(std::get<1>(edge_list[i])) };
+        if (active_edges.count(current_link)) {
+            double total_load_ij = 0.0;
+            for (size_t k = 0; k < traffic_demands.size(); ++k) {
+                auto it = flow_fractions[k].find(current_link);
+                if (it != flow_fractions[k].end() && it->second > 1e-9) {
+                    double demand_volume = std::get<2>(traffic_demands[k]);
+                    total_load_ij += it->second * demand_volume;
+                }
+            }
+            aggregated_edge_load[i] = total_load_ij;
+
+            double shannon_rate = baseline_result.r_opt[i];
+            double allocated_power = baseline_result.p_opt[i];
+
+            if (total_load_ij > 1e-9) {
+                if (shannon_rate > 1e-9) { 
+                    double transmission_time = total_load_ij / shannon_rate;
+                    physical_edge_time[i] = transmission_time;
+                    system_total_energy += allocated_power * transmission_time;
+                } else {
+                    physical_edge_time[i] = 99999.0;
+                    system_total_energy += allocated_power * 500.0;
+                }
+            } else {
+                physical_edge_time[i] = 0.0; 
+            }
+        }
+    }
+
+    // SPFA Topological sorting for maximum end-to-end delay
+    for (size_t k = 0; k < traffic_demands.size(); ++k) {
+        int src_node = static_cast<int>(std::get<0>(traffic_demands[k]));
+        int des_node = static_cast<int>(std::get<1>(traffic_demands[k]));
+        double demand_volume = std::get<2>(traffic_demands[k]);
+
+        std::map<int, std::vector<std::pair<int, double>>> adjacency_list;
+        std::set<int> active_nodes_in_flow;
+
+        for (size_t i = 0; i < edge_list.size(); ++i) {
+            Link current_link = { static_cast<int>(std::get<0>(edge_list[i])), static_cast<int>(std::get<1>(edge_list[i])) };
+            if (flow_fractions[k].count(current_link) && flow_fractions[k].at(current_link) > 1e-9) {
+                int u = current_link.first;
+                int v = current_link.second;
+
+                double flow_load_on_edge = flow_fractions[k].at(current_link) * demand_volume;
+                double flow_ratio = flow_load_on_edge / aggregated_edge_load[i];
+                double fractional_transmission_time = flow_ratio * physical_edge_time[i];
+
+                adjacency_list[u].push_back({ v, fractional_transmission_time });
+                active_nodes_in_flow.insert(u);
+                active_nodes_in_flow.insert(v);
+            }
+        }
+
+        if (active_nodes_in_flow.empty()) continue;
+
+        // SPFA Algorithm Execution
+        std::map<int, double> arrival_time;
+        std::queue<int> node_queue;
+        std::map<int, bool> in_queue;
+        std::map<int, int> visit_count;
+
+        for (int node : active_nodes_in_flow) {
+            arrival_time[node] = -1.0;
+            in_queue[node] = false;
+            visit_count[node] = 0;
+        }
+
+        arrival_time[src_node] = 0.0;
+        node_queue.push(src_node);
+        in_queue[src_node] = true;
+        visit_count[src_node] = 1;
+
+        bool has_routing_loop = false;
+
+        while (!node_queue.empty()) {
+            int u = node_queue.front();
+            node_queue.pop();
+            in_queue[u] = false;
+
+            for (const auto& edge : adjacency_list[u]) {
+                int v = edge.first;
+                double fractional_transmission_time = edge.second;
+
+                if (arrival_time[u] + fractional_transmission_time > arrival_time[v] + 1e-9) {
+                    arrival_time[v] = arrival_time[u] + fractional_transmission_time;
+
+                    if (!in_queue[v]) {
+                        node_queue.push(v);
+                        in_queue[v] = true;
+                        visit_count[v]++;
+
+                        if (visit_count[v] > active_nodes_in_flow.size()) {
+                            has_routing_loop = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (has_routing_loop) break;
+        }
+
+        if (has_routing_loop) {
+            std::cerr << "[Warning] Flow " << k << " (Static-Alloc) trapped in routing loop!\n";
+            system_max_delay = std::max(system_max_delay, 99999.0);
+        } else if (arrival_time.count(des_node) && arrival_time[des_node] > -0.5) {
+            double final_flow_delay = arrival_time[des_node];
+            if (final_flow_delay > system_max_delay) {
+                system_max_delay = final_flow_delay;
+            }
+        } else {
+            std::cerr << "[Warning] Flow " << k << " (Static-Alloc) failed to reach destination!\n";
+            system_max_delay = std::max(system_max_delay, 99999.0);
+        }
+    }
+
+    baseline_result.max_delay = system_max_delay;
+    baseline_result.max_sum_delay = system_max_delay;
+    baseline_result.total_energy = system_total_energy;
+
+    return baseline_result;
+}
 /**
  * @brief Executes the Lagrangian Dual Decomposition solver for joint routing and resource allocation.
  * 
