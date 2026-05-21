@@ -3,94 +3,81 @@
 #include "graph.h"       
 #include "solver_dual.h" 
 #include "ipm_solver.h"
-
 #include <chrono>
 #include <iostream>
 #include <stack>
 #include <cstdio>
 #include <cmath>
 #include <iomanip>
+#include <Eigen/Dense>
 #include <queue>   
 #include <fstream> 
-#include <vector>
-#include <map>
-#include <set>
-#include <string>
-#include <limits>
-#include <tuple>
-#include <Eigen/Dense>
 
 /**
- * @brief Structure to store comprehensive results for a specific algorithm iteration.
+ * @brief Encapsulates the comprehensive execution results of the optimization algorithm.
  * 
- * @note Contains both routing trajectories and advanced performance metrics (EE, JFI)
- * suitable for high-tier journal reporting.
+ * @note This struct maps directly to external interfaces (e.g., Pybind11). 
+ * Field names are preserved to ensure zero logic/binding alteration.
  */
-struct AlgorithmResult {
+struct AlgoResult {
     std::string name;
     int iter;
-    double best_objective;
+    double best_F;
     int active_links;
     double max_delay;
     double max_sum_delay;
-    double objective_difference;
+    double diff_F;
     double total_energy;
     int multipath_count;
     long long time_ms;
     
-    std::vector<std::map<Link, double>> final_flow_fractions;
+    std::vector<std::map<Link, double>> final_x_flow;
     
-    // Convergence Trajectories
-    std::vector<double> history_objective;
-    std::vector<double> history_delay;
-    std::vector<double> history_energy;
-    std::vector<double> history_sum_delay;
+    // Convergence trajectory history
+    std::vector<double> history_F;
+    std::vector<double> history_T;
+    std::vector<double> history_E;
+    std::vector<double> history_T_sum;
     std::vector<double> history_diff;
-    
-    // Advanced Benchmark Metrics
+    std::vector<double> flow_max_delays;
+
+    // Advanced comparative metrics
     double energy_efficiency;    
     double jain_fairness_index;  
     double avg_link_delay;       
     
-    std::vector<std::tuple<size_t, size_t, double>> traffic_demands;
+    // Traffic demand tuples (source, destination, demand_volume)
+    std::vector<std::tuple<size_t, size_t, double>> pd_data;
+    
+    // Microscopic resource allocation profiling
+    std::vector<double> final_p_opt;  // Optimized power allocation per link
+    std::vector<double> final_r_opt;  // Optimized capacity/rate per link
+    std::vector<double> final_l_opt;  // Lagrangian multipliers per link
 };
 
-/**
- * @brief Extracts the unique set of edges from a given collection of graph paths.
- * 
- * @param path_set Collection of generated paths (e.g., from K-Shortest Paths).
- * @return std::set<Link> Set of unique active edges forming the subgraph.
- */
-std::set<Link> extract_subgraph_edges_main(const std::vector<GraphPath>& path_set) {
-    std::set<Link> subgraph_edges;
-    for (const auto& path : path_set) {
-        if (path.size() < 2) continue;
-        for (size_t i = 0; i < path.size() - 1; ++i) {
-            int u = static_cast<int>(path[i]);
-            int v = static_cast<int>(path[i + 1]);
-            subgraph_edges.insert({ u, v });
-        }
-    }
-    return subgraph_edges;
-}
+using namespace std;
+using namespace std::chrono;
 
 /**
- * @brief Validates end-to-end physical layer connectivity for all commodities.
+ * @brief Validates physical layer connectivity for all traffic demands using Breadth-First Search (BFS).
  * 
- * @param num_nodes Total number of nodes in the graph.
- * @param link_rates Current physical capacity map of all edges.
- * @param traffic_demands Tuple containing source, destination, and demand volume.
- * @return true if all source-destination pairs are connected, false otherwise.
+ * @param num_nodes Total number of vertices in the network graph.
+ * @param capacity_map Map of active physical link capacities (edge -> capacity).
+ * @param traffic_demands Vector of source-destination demand tuples.
+ * @return true if all source-destination pairs are reachable, false otherwise.
  * 
- * @note Time Complexity: O(K * (V + E)), where K is the number of commodities.
- * Executes a Breadth-First Search (BFS) to guarantee routing feasibility before optimization.
+ * @note Time Complexity: O(K * (V + E)) where K is the number of commodities, 
+ * V is the number of nodes, and E is the number of active edges.
  */
 bool check_physical_connectivity(int num_nodes, 
-                                 const LinkMap& link_rates, 
+                                 const LinkMap& capacity_map, 
                                  const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands) {
     std::vector<std::vector<int>> adjacency_list(num_nodes);
-    for (const auto& pair : link_rates) {
-        if (pair.second > 1e-6) adjacency_list[pair.first.first].push_back(pair.first.second);
+    
+    for (const auto& pair : capacity_map) {
+        if (pair.second > 1e-6) {
+            adjacency_list[pair.first.first].push_back(pair.first.second);
+        }
     }
     
     bool all_connected = true;
@@ -132,148 +119,202 @@ bool check_physical_connectivity(int num_nodes,
 }
 
 /**
- * @brief Core execution engine for a single Block Coordinate Descent (BCD) experiment.
+ * @brief Executes a single network optimization experiment across multiple algorithms.
  * 
- * @param file_path Path to the graph topology CSV.
- * @param demand_file_path Path to the traffic demands CSV.
- * @param stress_factor Multiplier to scale baseline network traffic.
- * @param user_alpha Trade-off parameter between delay and energy consumption.
- * @return std::vector<AlgorithmResult> Collection of benchmarking results for all tested algorithms.
- * 
- * @note Implements an Alternating Optimization framework. The routing phase relies on 
- * Frank-Wolfe (FW) or Interior Point Method (IPM) to distribute traffic flows (O(K * E log V)), 
- * and the resource phase solves the Lagrangian dual via subgradient descent.
+ * @param file_path Path to the network topology configuration file.
+ * @param demand_file_path Path to the traffic demand matrix file.
+ * @param stress_factor Multiplier applied to baseline traffic demands.
+ * @param user_alpha Weighting parameter balancing delay and energy consumption.
+ * @return std::vector<AlgoResult> Collection of optimization profiles for each tested algorithm.
  */
-std::vector<AlgorithmResult> run_single_experiment(
+std::vector<AlgoResult> run_single_experiment(
     const std::string& file_path,
     const std::string& demand_file_path,
     double stress_factor,
     double user_alpha
 ) {
-    auto start_main = std::chrono::system_clock::now();
-    Col_gen graph_generator(file_path);
-    
+    auto start_main = system_clock::now();
+    Col_gen col_gen_graph(file_path);
     size_t max_node_id = 0;
-    for (const auto& edge : graph_generator.edge_list) {
+    
+    for (const auto& edge : col_gen_graph.edge_list) {
         max_node_id = std::max(max_node_id, std::get<0>(edge));
         max_node_id = std::max(max_node_id, std::get<1>(edge));
     }
     size_t num_nodes = max_node_id + 1;
-    Graph graph(num_nodes, graph_generator);
+    Graph graph(num_nodes, col_gen_graph);
 
     std::vector<std::tuple<size_t, size_t, double>> traffic_demands = Get_demand(demand_file_path);
-    int demand_num = static_cast<int>(traffic_demands.size());
+    int demand_num = traffic_demands.size();
     for (auto& demand : traffic_demands) {
         std::get<2>(demand) *= stress_factor;
     }
 
     // ==================================================================================
-    // 1. Initial KSP Probing & Flow Cold Start
+    // 1. Engine Initialization Phase
     // ==================================================================================
-    std::vector<std::map<Link, double>> flow_routing_fractions(demand_num);
-    std::vector<GraphPath> active_path_set;
-    int num_shortest_paths = 10;
-    int target_path_count = 3;
-
-    int demand_idx = 0;
-    for (const auto& demand : traffic_demands) {
-        size_t src = std::get<0>(demand);
-        size_t des = std::get<1>(demand);
-        
-        auto [primary_path, primary_path_length] = dijkstra(graph, src, des);
-        if (primary_path_length != 0 || src == des) {
-            auto candidate_paths = k_shortest_paths(target_path_count, primary_path, num_shortest_paths, graph_generator, graph, src);
-            if (!candidate_paths.empty()) {
-                double split_ratio = 1.0 / static_cast<double>(candidate_paths.size());
-                for (const auto& path : candidate_paths) {
-                    if (path.size() < 2) continue;
-                    for (size_t i = 0; i < path.size() - 1; ++i) {
-                        Link link = { static_cast<int>(path[i]), static_cast<int>(path[i + 1]) };
-                        flow_routing_fractions[demand_idx][link] += split_ratio; 
-                    }
-                }
-                active_path_set.insert(active_path_set.end(), candidate_paths.begin(), candidate_paths.end());
-            }
-        }
-        demand_idx++;
-    }
-
-    // ==================================================================================
-    // 2. Initial Resource Allocation
-    // ==================================================================================
-    std::set<Link> active_subgraph_edges = extract_subgraph_edges_main(active_path_set);
-    double max_power_per_node = 0.2;   
+    double max_power_per_node = 0.2;
     std::vector<double> node_power_limits(num_nodes, max_power_per_node);
-    double total_bandwidth_spectrum = 20.0;  
-    const double noise_power_density = -114.0;
+    double total_bandwidth_mhz = 100.0;  
+    const double noise_density_dbm = -114.0;
 
-    InitialAllocation res_alloc = initialize_resources(graph, active_subgraph_edges, node_power_limits, total_bandwidth_spectrum);
-    std::set<Link>& active_edges = res_alloc.E_active;
-    LinkMap& link_powers = res_alloc.p0;
-    LinkMap& dual_multipliers = res_alloc.l0;
+    InitializationResult init_res;
+    InitializationResult probe_res = initialize_with_ksp_warm(
+        graph, col_gen_graph, traffic_demands, num_nodes, max_power_per_node,
+        0.5, total_bandwidth_mhz, noise_density_dbm); 
 
-    LinkMap link_rates = calculate_rates(graph, num_nodes, active_edges, dual_multipliers, link_powers, noise_power_density, graph_generator.edge_list.size(), total_bandwidth_spectrum, node_power_limits);
+    auto [probe_T_max, probe_T_sum, probe_E_total, probe_delays] = evaluate_network_state(
+        traffic_demands, probe_res.x_flow, probe_res.r0, probe_res.p0, probe_res.l0, total_bandwidth_mhz, num_nodes
+    );
 
-    if (!check_physical_connectivity(num_nodes, link_rates, traffic_demands)) {
+    // Normalization Anchors (Zero-Division Protection)
+    const double ANCHOR_T = std::max(probe_T_max, 1e-5);
+    const double ANCHOR_E = std::max(probe_E_total, 1e-5);
+    
+    // Calculate effective alpha for inner algorithms using mathematical substitution
+    double weight_T = user_alpha / ANCHOR_T;
+    double weight_E = (1.0 - user_alpha) / ANCHOR_E;
+    double effective_alpha = weight_T / (weight_T + weight_E);
+
+    std::string init_strategy = "KSP_PDA"; 
+    std::cout << "\n================================================================================\n";
+    std::cout << ">>> Initializing Network with Strategy: " << init_strategy << "\n";
+    std::cout << "================================================================================\n";
+    
+    if (init_strategy == "KSP_PDA") {
+        init_res = initialize_with_ksp_warm(graph, col_gen_graph, traffic_demands, num_nodes, max_power_per_node, effective_alpha, total_bandwidth_mhz, noise_density_dbm);
+    } else {  
+        init_res = initialize_with_ggb_warm_start(graph, col_gen_graph, traffic_demands, num_nodes, max_power_per_node, total_bandwidth_mhz, noise_density_dbm);
+    }
+
+    // Unpack initialization state to preserve downstream pointer/loop compatibility
+    std::vector<std::map<Link, double>> x_flow = init_res.x_flow;
+    std::vector<std::map<Link, double>> init_x_flow = init_res.init_x_flow; 
+    std::set<Link> E_active = init_res.E_active;
+    LinkMap p0 = init_res.p0;
+    LinkMap l0 = init_res.l0;
+    LinkMap r0 = init_res.r0;
+
+    // ==================================================================================
+    // 2. Connectivity Validation
+    // ==================================================================================
+    if (!check_physical_connectivity(num_nodes, r0, traffic_demands)) {
         std::cerr << ">>> [ERROR] Critical connectivity failure! Aborting run!\n";
-        return {}; 
+        return {};
     }
 
     // ==================================================================================
-    // 3. Alternating Optimization Macro-Loop Configuration
+    // 3. Iteration-0 Convergence Safe Box
+    // ==================================================================================
+    double best_objective_value = std::numeric_limits<double>::max();
+    std::vector<std::map<Link, double>> best_x_flow = x_flow;
+    OptimizationResult best_dual_res;
+    
+    auto [init_T_max, init_T_sum, init_E_total, init_flow_delays] = evaluate_network_state(
+        traffic_demands, x_flow, r0, p0, l0, total_bandwidth_mhz, num_nodes);
+    
+    double initial_normalized_objective = user_alpha * (init_T_max / ANCHOR_T) + (1.0 - user_alpha) * (init_E_total / ANCHOR_E);
+    
+    // Pre-allocate Generation-0 bounds to prevent BCD fallback corruption
+    best_dual_res.l_opt.resize(col_gen_graph.edge_list.size(), 0.0);
+    best_dual_res.p_opt.resize(col_gen_graph.edge_list.size(), 0.0);
+    best_dual_res.r_opt.resize(col_gen_graph.edge_list.size(), 0.0);
+
+    for (size_t i = 0; i < col_gen_graph.edge_list.size(); ++i) {
+        Link lk = { static_cast<int>(std::get<0>(col_gen_graph.edge_list[i])), static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) };
+        best_dual_res.l_opt[i] = l0.count(lk) ? l0.at(lk) : 0.0;
+        best_dual_res.p_opt[i] = p0.count(lk) ? p0.at(lk) : 0.0;
+        best_dual_res.r_opt[i] = r0.count(lk) ? r0.at(lk) : 0.0;
+    }
+    
+    best_objective_value = initial_normalized_objective;
+    double best_T_max = init_T_max;
+    double best_E_total = init_E_total;
+    int best_active_links = E_active.size();
+    double best_T_sum = 0.0;  
+    double best_diff_F = 0.0; 
+
+    // Convergence telemetry trackers
+    double diff_F = std::numeric_limits<double>::max();
+    int current_iteration_idx = 999;
+    int outer_stall_count = 0;
+    double prev_objective_value = std::numeric_limits<double>::max();
+    double global_best_objective = std::numeric_limits<double>::max();
+
+    std::vector<double> current_hist_F, current_hist_T, current_hist_E;
+    std::vector<double> current_hist_T_sum, current_hist_diff;
+    const OptimizationResult BASELINE_dual_res = best_dual_res;
+
+    // ==================================================================================
+    // 4. Alternating Optimization Macro-Loop Setup
     // ==================================================================================
     const int MACRO_MAX_ITER = 10;
     const double PENALTY_WEIGHT = 1e6;
 
-    FWConfig config_fw;
-    config_fw.mu = 5.0;
-    config_fw.alpha = user_alpha;
-    config_fw.tolerance = 1e-4;
-    config_fw.epsilon = 0.05; 
-    config_fw.max_iter = 2e2;
+    // Immutable baselines to ensure clean algorithmic resets
+    const std::vector<std::map<Link, double>> BASELINE_x_flow = x_flow;
+    const std::set<Link> BASELINE_E_active = E_active;
+    const std::map<Link, double> BASELINE_r0 = r0;
+    const std::map<Link, double> BASELINE_p0 = p0;
+    const std::map<Link, double> BASELINE_l0 = l0;
+    const double BASELINE_F_initial = initial_normalized_objective;
 
-    std::vector<std::map<Link, double>> init_flow_fractions = flow_routing_fractions;
-    std::map<Link, double> init_link_rates = link_rates;
-    std::map<Link, double> init_link_powers = link_powers;
-    std::map<Link, double> init_dual_multipliers = dual_multipliers;
-
-    std::vector<AlgorithmResult> summary_results;
-    std::vector<std::string> test_algorithms = { "BCD-FW", "BCD-IPM", "SP-PDA", "KSP-PDA", "Static-Allocation", "Game-Greedy", "SCA-Baseline" };
+    std::vector<AlgoResult> summary_results;
+    std::vector<std::string> test_algorithms = { "BCD-FW", "BCD-IPM", "Game-Greedy", "Static-Allocation" }; 
+    
+    std::cout << "\n>>>(user_alpha=" << user_alpha << ") <<<\n";
 
     // ==================================================================================
-    // 4. Algorithm Benchmarking Execution
+    // 5. Dual-Engine Benchmarking Execution
     // ==================================================================================
     for (const auto& current_algo : test_algorithms) {
         std::cout << "\n\n================================================================================\n";
         std::cout << "  >>> Start: Evaluating [" << current_algo << "] Algorithm <<<\n";
         std::cout << "================================================================================\n";
-
-        flow_routing_fractions = init_flow_fractions;
-        link_rates = init_link_rates;
-        link_powers = init_link_powers;
-        dual_multipliers = init_dual_multipliers;
-        std::vector<std::map<Link, double>> prev_flow_fractions = flow_routing_fractions;
-
-        double best_objective = std::numeric_limits<double>::max();
-        double current_objective_difference = std::numeric_limits<double>::max(); 
-        double best_sum_delay = 0.0;
-        double best_objective_diff = 0.0;
-        int num_iter = 999;
         
-        std::vector<double> cur_hist_objective, cur_hist_delay, cur_hist_energy, cur_hist_sum_delay, cur_hist_diff;
+        // --- 0. Hard Reset: Physical & Network State ---
+        x_flow = BASELINE_x_flow;
+        E_active = BASELINE_E_active;
+        r0 = BASELINE_r0;
+        p0 = BASELINE_p0;
+        l0 = BASELINE_l0;
+
+        // --- 1. Hard Reset: Convergence Safe Box ---
+        best_objective_value = BASELINE_F_initial;
+        best_x_flow = BASELINE_x_flow;
+        best_dual_res = BASELINE_dual_res;
+
+        best_T_max = init_T_max;             
+        best_E_total = init_E_total;         
+        best_active_links = E_active.size(); 
+        best_T_sum = 0.0;
+        best_diff_F = 0.0;
+
+        // --- 2. Hard Reset: Telemetry & Step Counters ---
+        global_best_objective = std::numeric_limits<double>::max();
+        outer_stall_count = 0;
+        int slow_progress_count = 0;         
+
+        current_hist_F.clear();
+        current_hist_T.clear();
+        current_hist_E.clear();
+        current_hist_T_sum.clear();
+        current_hist_diff.clear();
+
+        std::vector<std::map<Link, double>> prev_x_flow = BASELINE_x_flow;
         
-        double prev_objective = std::numeric_limits<double>::max();
-        double global_best_objective = std::numeric_limits<double>::max();
-        int outer_stall_count = 0;
-
-        std::vector<std::map<Link, double>> best_flow_fractions;
-        OptimizationResult best_dual_res;
-        double best_max_delay = 0.0;
-        double best_total_energy = 0.0;
-        int best_active_links = 0;
-
+        // Optimization Configurations
+        FWConfig config_fw;
+        config_fw.mu = 5.0;  
+        config_fw.alpha = effective_alpha; 
+        config_fw.tolerance = 1e-4;
+        config_fw.epsilon = 0.05;
+        config_fw.max_iter = 100;
+        
+        IPMConfig config_ipm = { 200, 1e-4, 1e-3, config_fw.mu }; 
+        
         auto start_algo = std::chrono::system_clock::now();
-
+        
         // ---------------------------------------------------------
         // Macro BCD Alternating Optimization
         // ---------------------------------------------------------
@@ -281,37 +322,62 @@ std::vector<AlgorithmResult> run_single_experiment(
             std::cout << "\n\n================================================================================\n";
             std::cout << "\n--- " << current_algo << " | Macro Iteration " << iter << " ---\n";
             std::cout << "================================================================================\n";
-            num_iter = iter;
-
-            // --- [Phase A]: Routing Subproblem ---
+            current_iteration_idx = iter;
+            
+            // =========================================================
+            // [Phase A]: Routing Phase
+            // =========================================================
             if (current_algo == "BCD-FW") {
                 std::cout << "[Routing Phase] Running BCD-FW Algorithm...\n";
                 std::map<Link, double> dynamic_edge_weights;
-                for (const auto& edge : graph_generator.edge_list) {
-                    Link lk = { static_cast<int>(std::get<0>(edge)), static_cast<int>(std::get<1>(edge)) };
-                    if (link_rates.count(lk) && link_rates[lk] < 1e-6) dynamic_edge_weights[lk] = PENALTY_WEIGHT;
-                }
-                solve_frank_wolfe(graph, graph_generator.edge_list, num_nodes, active_edges, traffic_demands, link_rates, link_powers, flow_routing_fractions, config_fw, dynamic_edge_weights);
+                solve_frank_wolfe(graph, col_gen_graph.edge_list, num_nodes, E_active, traffic_demands, r0, p0, x_flow, config_fw, dynamic_edge_weights);
+                config_fw.mu *= 1.1; // Progressively harden LSE smoothing
             }
             else if (current_algo == "BCD-IPM") {
                 std::cout << "[Routing Phase] Running Primal-Dual BCD-IPM Algorithm...\n";
-                IPMConfig config_ipm = { 200, 1e-4, 1e-3 };
-                solve_ipm_routing(graph, graph_generator.edge_list, num_nodes, traffic_demands, link_rates, link_powers, flow_routing_fractions, config_ipm, user_alpha);
+                solve_ipm_routing(graph, col_gen_graph.edge_list, num_nodes, traffic_demands, r0, p0, x_flow, config_ipm, effective_alpha); 
+                config_ipm.mu *= 1.1;
             }
             else if (current_algo == "KSP-PDA") {
                 std::cout << "[Routing Phase] Loading Static KSP-PDA Routes (Evenly split)...\n";
-                flow_routing_fractions = init_flow_fractions;
+                x_flow.clear();
+                x_flow.resize(traffic_demands.size());
+                
+                int k_max_paths = 10;
+                int active_k_paths = 3;  
+                int demand_idx = 0;
+                
+                for (const auto& demand : traffic_demands) {
+                    size_t src = std::get<0>(demand);
+                    size_t des = std::get<1>(demand);
+                    
+                    auto [p1, p1_length] = dijkstra(graph, src, des);
+                    if (p1_length != 0 || src == des) {
+                        auto multipath_routes = k_shortest_paths(active_k_paths, p1, k_max_paths, col_gen_graph, graph, src);
+                        if (!multipath_routes.empty()) {
+                            double split_ratio = 1.0 / static_cast<double>(multipath_routes.size());
+                            for (const auto& path : multipath_routes) {
+                                if (path.size() < 2) continue;
+                                for (size_t i = 0; i < path.size() - 1; ++i) {
+                                    Link link = { static_cast<int>(path[i]), static_cast<int>(path[i + 1]) };
+                                    x_flow[demand_idx][link] += split_ratio;
+                                }
+                            }
+                        }
+                    }
+                    demand_idx++;
+                }
             }
             else if (current_algo == "Static-Allocation" || current_algo == "SP-PDA") {
                 std::cout << "[Routing Phase] Running Static Allocation (100% on Single Shortest Path)...\n";
                 for (size_t k = 0; k < traffic_demands.size(); ++k) {
-                    flow_routing_fractions[k].clear();
+                    x_flow[k].clear();
                     size_t src = std::get<0>(traffic_demands[k]);
                     size_t des = std::get<1>(traffic_demands[k]);
-                    auto [primary_path, primary_path_length] = dijkstra(graph, src, des);
-                    if (primary_path_length != 0 || src == des) {
-                        for (size_t i = 0; i < primary_path.size() - 1; ++i) {
-                            flow_routing_fractions[k][{ static_cast<int>(primary_path[i]), static_cast<int>(primary_path[i + 1]) }] = 1.0;
+                    auto [p1, p1_length] = dijkstra(graph, src, des);
+                    if (p1_length != 0 || src == des) {
+                        for (size_t i = 0; i < p1.size() - 1; ++i) {
+                            x_flow[k][{ static_cast<int>(p1[i]), static_cast<int>(p1[i + 1]) }] = 1.0;
                         }
                     }
                 }
@@ -320,371 +386,445 @@ std::vector<AlgorithmResult> run_single_experiment(
                 std::cout << "[Routing Phase] Game-Greedy does Joint Optimization. Bypassing decoupled routing...\n";
             }
             
-            // --- [Phase B]: Resource Allocation Subproblem ---
+            // =========================================================
+            // [Phase B]: Resource Allocation Phase
+            // =========================================================
             OptimizationResult dual_res;
+            
             if (current_algo == "Static-Allocation") {
                 std::cout << "[Resource Phase] Running Equal Resource Allocation (ERA)...\n";
-                dual_res = run_static_equal_allocation(graph_generator.edge_list, traffic_demands, flow_routing_fractions, total_bandwidth_spectrum, max_power_per_node, noise_power_density);
+                dual_res = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
             }
             else if (current_algo == "Game-Greedy") {
                 std::cout << "[Resource Phase] Running Game-Greedy Joint Allocation...\n";
-                dual_res = run_game_greedy_baseline(graph_generator.edge_list, num_nodes, node_power_limits, total_bandwidth_spectrum, traffic_demands, noise_power_density);
-                flow_routing_fractions = dual_res.final_x_flow;
+                dual_res = run_game_greedy_baseline(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, noise_density_dbm);
+                // Sync optimized routes generated internally back to global state
+                x_flow = dual_res.final_x_flow;
             }
             else if (current_algo == "SCA-Baseline") {
                 std::cout << "[Resource Phase] Running SCA-Based Joint Allocation...\n";
-                dual_res = run_sca_baseline(graph_generator.edge_list, num_nodes, node_power_limits, total_bandwidth_spectrum, traffic_demands, noise_power_density);
-                flow_routing_fractions = dual_res.final_x_flow;
+                dual_res = run_sca_baseline(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, noise_density_dbm);
+                x_flow = dual_res.final_x_flow;
             }
             else {
                 std::cout << "[Resource Phase] Running Lagrangian Dual Decomposition...\n";
-                try {
-                    dual_res = run_dual_decomposition_solver(graph_generator.edge_list, num_nodes, node_power_limits, total_bandwidth_spectrum, traffic_demands, flow_routing_fractions, noise_power_density, user_alpha, 1e-4);
+                bool x_is_clean = true;
+                for (const auto& flow_map : x_flow) {
+                    for (const auto& pair : flow_map) {
+                        if (std::isnan(pair.second) || std::isinf(pair.second)) {
+                            std::cout << "  [Error] Corrupted flow x passed to LDD!\n";
+                            x_is_clean = false;
+                        }
+                    }
                 }
-                catch (const std::exception & e) {
-                    std::cerr << "!!! Error: " << e.what() << std::endl; break;
+                
+                if (current_algo == "KSP-PDA" || current_algo == "SP-PDA") {
+                    // Track 1: Baseline Mode (PDA with single fail-safe)
+                    try {
+                        dual_res = run_dual_decomposition_solver(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, x_flow, noise_density_dbm, effective_alpha, 1e-2); 
+
+                        // Fail-safe circuit breaker
+                        if (dual_res.max_sum_delay > 500.0) {
+                            std::cout << "  >>> [WARNING] PDA diverged! Triggering Static Equal Allocation as Safe Net.\n";
+                            dual_res = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
+                        }
+                    }
+                    catch (const std::exception & e) {
+                        std::cerr << "!!! Error in PDA: " << e.what() << std::endl; 
+                        break;
+                    }
+                }
+                else {
+                    // Track 2: Iterative Algorithm Protection Track
+                    std::cout << "[Resource Phase] Running Protected Allocation...\n";
+
+                    OptimizationResult res_ldd; 
+                    
+                    try {
+                        res_ldd = run_dual_decomposition_solver(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, x_flow, noise_density_dbm, effective_alpha, 1e-2);
+                        
+                        if (res_ldd.max_sum_delay > 500.0) {
+                            std::cout << "  >>> [WARNING] PDA solver diverged (Delay > 500)! \n";
+                            std::cout << "  >>> [Fallback] Triggering Static Equal Allocation as Safe Net.\n";
+                            res_ldd = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
+                        }
+                    }
+                    catch (const std::exception& e) {
+                        std::cerr << "  >>> [WARNING] PDA Exception: " << e.what() << std::endl;
+                        std::cout << "  >>> [Fallback] Triggering Static Equal Allocation as Safe Net.\n";
+                        res_ldd = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
+                    }
+                    dual_res = res_ldd; 
                 }
             }
+// ==================================================================================
+            // [Phase C]: State Update (Momentum) & Surrogate Evaluation
+            // ==================================================================================
+            const double momentum_factor = 0.5;
+            const double capacity_epsilon = 1e-9; 
 
-            // --- [Phase C]: State Update & Evaluation ---
-            double momentum_beta = 0.8;
-            double min_virtual_rate = 0.05;
-            double min_physical_rate = 0.1; 
             int current_active_links = 0;
 
-            for (size_t i = 0; i < graph_generator.edge_list.size(); ++i) {
-                Link lk = { static_cast<int>(std::get<0>(graph_generator.edge_list[i])), static_cast<int>(std::get<1>(graph_generator.edge_list[i])) };
-                double new_dual = dual_res.l_opt[i];
+            for (size_t i = 0; i < col_gen_graph.edge_list.size(); ++i) {
+                Link current_link = { 
+                    static_cast<int>(std::get<0>(col_gen_graph.edge_list[i])), 
+                    static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) 
+                };
+
+                double new_lambda = dual_res.l_opt[i];
                 double new_power = dual_res.p_opt[i];
-                double new_rate = dual_res.r_opt[i];
-                
-                if (new_rate > 1e-6) current_active_links++;
+                double new_capacity = dual_res.r_opt[i];
+
+                if (new_capacity > 1e-6) {
+                    current_active_links++; 
+                }
 
                 if (current_algo == "BCD-FW" || current_algo == "BCD-IPM") {
-                    bool has_traffic = false;
-                    for (size_t k = 0; k < traffic_demands.size(); ++k) {
-                        if (flow_routing_fractions[k].count(lk) && flow_routing_fractions[k][lk] > 1e-4) { has_traffic = true; break; }
-                    }
-                    if (has_traffic && new_rate < min_physical_rate) {
-                        new_rate = min_physical_rate;
-                    }
-                    if (new_rate > 1e-6) current_active_links++;
-
-                    if (iter == 1) {
-                        dual_multipliers[lk] = new_dual; 
-                        link_powers[lk] = new_power; 
-                        link_rates[lk] = std::max(new_rate, min_virtual_rate);
-                    }
-                    else {
-                        dual_multipliers[lk] = momentum_beta * dual_multipliers[lk] + (1.0 - momentum_beta) * new_dual;
-                        link_powers[lk] = momentum_beta * link_powers[lk] + (1.0 - momentum_beta) * new_power;
-                        link_rates[lk] = std::max(momentum_beta * link_rates[lk] + (1.0 - momentum_beta) * new_rate, min_virtual_rate);
+                    if (current_iteration_idx == 1) {
+                        l0[current_link] = new_lambda;
+                        p0[current_link] = new_power;
+                        r0[current_link] = std::max(new_capacity, capacity_epsilon); 
+                    } else {
+                        l0[current_link] = momentum_factor * l0[current_link] + (1.0 - momentum_factor) * new_lambda;
+                        p0[current_link] = momentum_factor * p0[current_link] + (1.0 - momentum_factor) * new_power;
+                        r0[current_link] = std::max(momentum_factor * r0[current_link] + (1.0 - momentum_factor) * new_capacity, capacity_epsilon);
                     }
                 }
             }
 
-            double current_objective_val = user_alpha * (dual_res.max_sum_delay) + (1.0 - user_alpha) * (dual_res.total_energy);
-            current_objective_difference = user_alpha * (dual_res.max_sum_delay) - user_alpha * (dual_res.max_delay);
-            current_objective_difference = (current_objective_difference > 1e-6) ? current_objective_difference : 0.0;
-
-            std::cout << " --> Max Delay: " << dual_res.max_delay << " s, Total Energy: " << dual_res.total_energy 
-                      << " J | Objective: " << current_objective_val << " Gap: " << current_objective_difference << "\n";
-
-            cur_hist_objective.push_back(current_objective_val);
-            cur_hist_delay.push_back(dual_res.max_delay);
-            cur_hist_sum_delay.push_back(dual_res.max_sum_delay); 
-            cur_hist_diff.push_back(current_objective_difference);                  
-            cur_hist_energy.push_back(dual_res.total_energy);
-
-            if (iter == 1 || current_objective_val < best_objective) {
-                best_objective = current_objective_val;
-                best_flow_fractions = flow_routing_fractions;
-                best_dual_res = dual_res;
-                best_max_delay = dual_res.max_delay;
-                best_total_energy = dual_res.total_energy;
-                best_active_links = current_active_links;
-                best_sum_delay = dual_res.max_sum_delay;
-                best_objective_diff = current_objective_difference;
+            // ==================================================================================
+            // Global Assessor Verification
+            // Note: The algorithm's internal dual_res must be strictly verified by the 
+            // global physical state evaluator to prevent surrogate objective pollution.
+            // ==================================================================================
+            std::map<Link, double> current_capacity_map;
+            std::map<Link, double> current_power_map;
+            std::map<Link, double> current_lambda_map;
+            
+            for (size_t i = 0; i < col_gen_graph.edge_list.size(); ++i) {
+                Link current_link = { 
+                    static_cast<int>(std::get<0>(col_gen_graph.edge_list[i])), 
+                    static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) 
+                };
+                current_capacity_map[current_link] = dual_res.r_opt[i];
+                current_power_map[current_link] = dual_res.p_opt[i];
+                current_lambda_map[current_link] = dual_res.l_opt[i];
             }
 
-            if (current_algo == "Static-Allocation" || current_algo == "KSP-PDA" || current_algo == "SP-PDA" || current_algo == "Game-Greedy" || current_algo == "SCA-Baseline") {
+            auto [referee_max_delay, referee_max_sum_delay, referee_total_energy, flow_delays] = evaluate_network_state(
+                traffic_demands, x_flow, current_capacity_map, current_power_map, current_lambda_map, total_bandwidth_mhz, num_nodes
+            );
+
+            // Track A: Surrogate Score (Used for algorithmic convergence driving)
+            double surrogate_objective = user_alpha * (referee_max_sum_delay / ANCHOR_T) +
+                                         (1.0 - user_alpha) * (referee_total_energy / ANCHOR_E);
+
+            // Track B: Strict Physical Score (Used for historical best validation)
+            double physical_objective = user_alpha * (referee_max_delay / ANCHOR_T) +
+                                        (1.0 - user_alpha) * (referee_total_energy / ANCHOR_E);
+            
+            double objective_gap = user_alpha * referee_max_sum_delay - user_alpha * referee_max_delay;
+            objective_gap = (objective_gap > 1e-6) ? objective_gap : 0.0;
+
+            // Record validated metrics into historical trajectories
+            current_hist_F.push_back(physical_objective);
+            current_hist_T.push_back(referee_max_delay);
+            current_hist_T_sum.push_back(referee_max_sum_delay); 
+            current_hist_diff.push_back(objective_gap);
+            current_hist_E.push_back(referee_total_energy);
+
+            // ==================================================================================
+            // Convergence Safe Box Ratchet Mechanism
+            // ==================================================================================
+            bool is_single_shot_baseline = (current_algo == "Static-Allocation" ||
+                                            current_algo == "KSP-PDA" ||
+                                            current_algo == "SP-PDA" ||
+                                            current_algo == "Game-Greedy" ||
+                                            current_algo == "SCA-Baseline");
+
+            if (is_single_shot_baseline || physical_objective < best_objective_value - 1e-5) {
+                best_objective_value = physical_objective;
+                best_x_flow = x_flow;
+                best_dual_res = dual_res;
+                best_T_max = referee_max_delay;
+                best_E_total = referee_total_energy;
+                best_active_links = current_active_links;
+                best_T_sum = referee_max_sum_delay;
+                best_diff_F = objective_gap;
+            }
+
+            if (is_single_shot_baseline) {
                 std::cout << ">>> [" << current_algo << "] is a static/decoupled baseline. Exiting macro-loop early! <<<\n";
                 break;
             }
 
-            int slow_progress_count = 0;
-            if (iter > 1) {
-                if (current_objective_val < global_best_objective) { global_best_objective = current_objective_val; outer_stall_count = 0; }
-                else { outer_stall_count++; }
-
-                if (current_objective_val > prev_objective * 1.05) { std::cout << ">>> Objective degraded > 5%, Stop! <<<\n"; break; }
-                if (outer_stall_count >= 3) { std::cout << ">>> No improvement within 3 iterations, Stop! <<<\n"; break; }
-                
-                double rel_imp = (prev_objective - current_objective_val) / (prev_objective + 1e-9);
-                if (rel_imp > 0 && rel_imp < 1e-3) {
-                    slow_progress_count++; 
+            // Algorithmic Stall & Convergence Detection
+            if (current_iteration_idx > 1) {
+                if (surrogate_objective < global_best_objective - 1e-5) { 
+                    global_best_objective = surrogate_objective; 
+                    outer_stall_count = 0; 
+                } else { 
+                    outer_stall_count++; 
                 }
-                else if (rel_imp >= 1e-3) {
+
+                if (outer_stall_count >= 1) { 
+                    std::cout << ">>> Convergence Threshold Reached: No improvement within 1 iteration. Terminating! <<<\n"; 
+                    break; 
+                }
+                
+                double relative_improvement = (prev_objective_value - surrogate_objective) / (prev_objective_value + 1e-9);
+                
+                if (relative_improvement > 0 && relative_improvement < 1e-3) {
+                    slow_progress_count++; 
+                } else if (relative_improvement >= 1e-3) {
                     slow_progress_count = 0; 
                 }
                 
-                if (slow_progress_count >= 3) {
-                    std::cout << ">>> Convergence is too slow (rel_imp < 1e-3 for 3 iters). Stopping! <<<\n";
+                if (slow_progress_count >= 2) {
+                    std::cout << ">>> Convergence Degradation: Progress rate < 1e-3 for 2 consecutive iterations. Terminating! <<<\n";
                     break;
                 }
+            } else { 
+                global_best_objective = surrogate_objective; 
             }
-            else { global_best_objective = current_objective_val; }
 
-            prev_objective = current_objective_val;
-            prev_flow_fractions = flow_routing_fractions;
+            prev_objective_value = surrogate_objective;
+            prev_x_flow = x_flow;
         }
 
+        // ---------------------------------------------------------
+        // Post-Processing & Final Metric Consolidation
+        // ---------------------------------------------------------
         auto end_algo = std::chrono::system_clock::now();
         long long duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_algo - start_algo).count();
 
-        // Flow conservation healing for interior point methods
-        if (current_algo == "BCD-IPM") {
-            for (size_t k = 0; k < traffic_demands.size(); ++k) {
-                size_t src = std::get<0>(traffic_demands[k]);
-                std::map<int, double> out_sum;
-                std::map<int, int> in_degree;
-                for (const auto& pair : best_flow_fractions[k]) {
-                    out_sum[pair.first.first] += pair.second;
-                    in_degree[pair.first.second]++;
-                }
-
-                std::map<Link, double> healed_flow;
-                std::map<int, double> perfect_node_flow;
-                perfect_node_flow[(int)src] = 1.0;
-                std::queue<int> node_queue;
-                node_queue.push((int)src);
-
-                while (!node_queue.empty()) {
-                    int u = node_queue.front(); node_queue.pop();
-                    double current_flow = perfect_node_flow[u];
-                    if (out_sum[u] > 1e-9) {
-                        for (const auto& pair : best_flow_fractions[k]) {
-                            if (pair.first.first == u) {
-                                int v = pair.first.second;
-                                double flow_to_v = current_flow * (pair.second / out_sum[u]);
-                                healed_flow[{u, v}] = flow_to_v;
-                                perfect_node_flow[v] += flow_to_v;
-                                in_degree[v]--;
-                                if (in_degree[v] == 0) node_queue.push(v);
-                            }
-                        }
-                    }
-                }
-                best_flow_fractions[k] = healed_flow;
-            }
-        }
-
-        int multipath_count = 0;
-        for (size_t k = 0; k < traffic_demands.size(); ++k) {
-            size_t src = std::get<0>(traffic_demands[k]);
-            int outgoing_edges = 0;
-            for (const auto& pair : best_flow_fractions[k]) {
-                if (pair.first.first == (int)src && pair.second > 0.01) outgoing_edges++;
-            }
-            if (outgoing_edges > 1) multipath_count++;
-        }
-
-        // =========================================================
-        // Advanced Benchmark Metric Processing
-        // =========================================================
-        double total_demand_volume = 0.0;
-        for (const auto& demand : traffic_demands) total_demand_volume += std::get<2>(demand);
-
-        double energy_efficiency_val = (best_total_energy > 1e-9) ? (total_demand_volume / best_total_energy) : 0.0;
-
-        std::map<Link, double> edge_traffic;
-        std::map<Link, double> optimized_link_rates; 
-        for (size_t i = 0; i < graph_generator.edge_list.size(); ++i) {
-            Link lk = { static_cast<int>(std::get<0>(graph_generator.edge_list[i])), static_cast<int>(std::get<1>(graph_generator.edge_list[i])) };
-            optimized_link_rates[lk] = best_dual_res.r_opt[i];
-        }
+        std::map<Link, double> eval_capacity_map;
+        std::map<Link, double> eval_power_map;
+        std::map<Link, double> eval_lambda_map;
         
+        for (size_t i = 0; i < col_gen_graph.edge_list.size(); ++i) {
+            Link current_link = { 
+                static_cast<int>(std::get<0>(col_gen_graph.edge_list[i])), 
+                static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) 
+            };
+            eval_capacity_map[current_link] = (best_dual_res.r_opt.size() > i) ? best_dual_res.r_opt[i] : 0.0;
+            eval_power_map[current_link] = (best_dual_res.p_opt.size() > i) ? best_dual_res.p_opt[i] : 0.0;
+            eval_lambda_map[current_link] = (best_dual_res.l_opt.size() > i) ? best_dual_res.l_opt[i] : 0.0;
+        }
+
+        auto [final_max_delay, final_sum_delay, final_total_energy, final_delays] = evaluate_network_state(
+            traffic_demands, best_x_flow, eval_capacity_map, eval_power_map, eval_lambda_map, total_bandwidth_mhz, num_nodes
+        );
+
+        int multipath_routing_count = 0;
+        for (size_t k = 0; k < traffic_demands.size(); ++k) {
+            std::map<int, int> node_outgoing_branches;
+            for (const auto& pair : best_x_flow[k]) {
+                if (pair.second > 0.009) { 
+                    node_outgoing_branches[pair.first.first]++;
+                }
+            }
+
+            bool exhibits_multipath = false;
+            for (const auto& branch_info : node_outgoing_branches) {
+                if (branch_info.second > 1) { 
+                    exhibits_multipath = true;
+                    break;
+                }
+            }
+            if (exhibits_multipath) multipath_routing_count++;
+        }
+
+        double total_demand_volume = 0.0;
+        for (const auto& demand : traffic_demands) {
+            total_demand_volume += std::get<2>(demand);
+        }
+        double energy_efficiency_mbits_per_joule = (final_total_energy > 1e-9) ? (total_demand_volume / final_total_energy) : 0.0;
+
+        std::map<Link, double> edge_traffic_load;
         for (size_t k = 0; k < traffic_demands.size(); ++k) {
             double demand_volume = std::get<2>(traffic_demands[k]);
-            for (const auto& pair : best_flow_fractions[k]) {
-                if (pair.second > 1e-4) edge_traffic[pair.first] += pair.second * demand_volume;
+            for (const auto& pair : best_x_flow[k]) {
+                if (pair.second > 1e-4) {
+                    edge_traffic_load[pair.first] += pair.second * demand_volume;
+                }
             }
         }
 
-        double cumulative_congestion = 0.0;
-        int used_links = 0;
-        for (const auto& pair : edge_traffic) {
-            Link lk = pair.first;
-            double link_bandwidth = optimized_link_rates[lk];
-            if (link_bandwidth > 1e-6) {
-                cumulative_congestion += (pair.second / link_bandwidth); 
-                used_links++;
+        double aggregate_congestion = 0.0;
+        int utilized_link_count = 0;
+        for (const auto& pair : edge_traffic_load) {
+            Link current_link = pair.first;
+            double link_capacity = eval_capacity_map[current_link]; 
+            if (link_capacity > 1e-6) {
+                aggregate_congestion += (pair.second / link_capacity); 
+                utilized_link_count++;
             }
         }
-        double avg_congestion = (used_links > 0) ? (cumulative_congestion / used_links) : 0.0;
+        double mean_link_congestion = (utilized_link_count > 0) ? (aggregate_congestion / utilized_link_count) : 0.0;
 
-        const auto& delay_per_flow = best_dual_res.flow_max_delays;
-        double sum_delays = 0.0;
-        double sum_squared_delays = 0.0;
-        size_t total_commodities = delay_per_flow.size(); 
+        double sum_delay = 0.0;
+        double sum_delay_squared = 0.0;
+        size_t valid_commodity_count = final_delays.size();
 
-        for (double flow_delay : delay_per_flow) {
-            sum_delays += flow_delay;
-            sum_squared_delays += flow_delay * flow_delay;
+        for (double delay_val : final_delays) {
+            sum_delay += delay_val;
+            sum_delay_squared += delay_val * delay_val;
         }
 
-        double jain_fairness_idx = (total_commodities > 0 && sum_squared_delays > 1e-12) ?
-            ((sum_delays * sum_delays) / (static_cast<double>(total_commodities) * sum_squared_delays)) : 0.0;
+        double jain_fairness_index = (valid_commodity_count > 0 && sum_delay_squared > 1e-12) ?
+            ((sum_delay * sum_delay) / (static_cast<double>(valid_commodity_count) * sum_delay_squared)) : 0.0;
 
-        AlgorithmResult current_res;
-        current_res.iter = num_iter;
+        // ==================================================================================
+        // Structure Serialization & Final Output Pipeline
+        // ==================================================================================
+        AlgoResult current_res;
+
+        current_res.iter = current_iteration_idx;
         current_res.name = current_algo;
-        current_res.best_objective = best_objective;
+        current_res.best_F = user_alpha * (final_max_delay / ANCHOR_T) + (1.0 - user_alpha) * (final_total_energy / ANCHOR_E); 
         current_res.active_links = best_active_links;
-        current_res.max_delay = best_max_delay;
-        current_res.total_energy = best_total_energy;
-        current_res.multipath_count = multipath_count;
+        current_res.max_delay = final_max_delay;       
+        current_res.total_energy = final_total_energy;    
+        current_res.multipath_count = multipath_routing_count;
         current_res.time_ms = duration_ms;
-        current_res.final_flow_fractions = best_flow_fractions;
-        current_res.max_sum_delay = best_sum_delay;
-        current_res.objective_difference = best_objective_diff;
+        current_res.final_x_flow = best_x_flow;
+        current_res.max_sum_delay = best_T_sum;
+        current_res.diff_F = best_diff_F;
+        current_res.flow_max_delays = std::move(final_delays);
 
-        current_res.energy_efficiency = energy_efficiency_val;
-        current_res.avg_link_delay = avg_congestion; 
-        current_res.jain_fairness_index = jain_fairness_idx;
+        current_res.final_p_opt = best_dual_res.p_opt;
+        current_res.final_r_opt = best_dual_res.r_opt;
+        current_res.final_l_opt = best_dual_res.l_opt;
 
-        current_res.history_objective = cur_hist_objective;
-        current_res.history_delay = cur_hist_delay;
-        current_res.history_energy = cur_hist_energy;
-        current_res.traffic_demands = traffic_demands;
-        current_res.history_sum_delay = cur_hist_sum_delay;
-        current_res.history_diff = cur_hist_diff;
+        current_res.energy_efficiency = energy_efficiency_mbits_per_joule;
+        current_res.avg_link_delay = mean_link_congestion; 
+        current_res.jain_fairness_index = jain_fairness_index;
+
+        current_res.history_F = current_hist_F;
+        current_res.history_T = current_hist_T;
+        current_res.history_E = current_hist_E;
+        current_res.pd_data = traffic_demands;
+        current_res.history_T_sum = current_hist_T_sum;
+        current_res.history_diff = current_hist_diff;
 
         summary_results.push_back(current_res);
     }
 
     // ==================================================================================
-    // 5. Benchmark Reporting Module
+    // Terminal Benchmark Reporting
     // ==================================================================================
     std::cout << "\n\n";
     std::cout << "================================================================================================\n";
-    std::cout << "                               Algorithm Comparison                                             \n";
+    std::cout << "                                 Algorithm Performance Comparison                               \n";
     std::cout << "================================================================================================\n";
     std::cout << std::left
-        << std::setw(15) << "Algorithm"
-        << "| " << std::setw(10) << "Obj (F)"
-        << "| " << std::setw(15) << "Active Links"
-        << "| " << std::setw(12) << "T_max (s)"
-        << "| " << std::setw(15) << "E_total (J)"
-        << "| " << std::setw(10) << "Multipath"
-        << "| " << "Time (ms)" << "\n";
+              << std::setw(15) << "Algorithm"
+              << "| " << std::setw(10) << "Obj (F)"
+              << "| " << std::setw(15) << "Active Links"
+              << "| " << std::setw(12) << "T_max (s)"
+              << "| " << std::setw(15) << "E_total (J)"
+              << "| " << std::setw(10) << "Multipath"
+              << "| " << "Time (ms)" << "\n";
     std::cout << "------------------------------------------------------------------------------------------------\n";
 
     for (const auto& res : summary_results) {
         std::cout << std::left
-            << std::setw(15) << res.name
-            << "| " << std::setw(10) << std::fixed << std::setprecision(4) << res.best_objective
-            << "| " << std::setw(15) << (std::to_string(res.active_links) + " / " + std::to_string(graph_generator.edge_list.size()))
-            << "| " << std::setw(12) << res.max_delay
-            << "| " << std::setw(15) << res.total_energy
-            << "| " << std::setw(10) << res.multipath_count
-            << "| " << res.time_ms << "\n";
+                  << std::setw(15) << res.name
+                  << "| " << std::setw(10) << std::fixed << std::setprecision(4) << res.best_F
+                  << "| " << std::setw(15) << (std::to_string(res.active_links) + " / " + std::to_string(col_gen_graph.edge_list.size()))
+                  << "| " << std::setw(12) << res.max_delay
+                  << "| " << std::setw(15) << res.total_energy
+                  << "| " << std::setw(10) << res.multipath_count
+                  << "| " << res.time_ms << "\n";
     }
     std::cout << "================================================================================================\n";
 
-    std::cout << "\n>>> Stress Factor = " << stress_factor << "x <<<\n";
+    std::cout << "\n>>> Stress Factor Validation = " << stress_factor << "x <<<\n";
+
     for (const auto& res : summary_results) {
         std::cout << "  -> Algorithm [" << std::left << std::setw(15) << res.name << "] : ";
+
         if (res.multipath_count > 0) {
-            std::cout << "Commodities triggering multipath routing: " << res.multipath_count << " / " << traffic_demands.size() << "\n";
-        }
-        else {
-            std::cout << "Commodities triggering multipath routing: 0\n";
+            std::cout << "Commodities utilizing multi-path routing: "
+                      << res.multipath_count << " / " << traffic_demands.size() << "\n";
+        } else {
+            std::cout << "Commodities utilizing multi-path routing: 0\n";
         }
     }
     std::cout << "================================================================================\n\n";
 
-    auto end_main = std::chrono::system_clock::now();
-    std::cout << "\n[Main] Total execution time: " << std::chrono::duration_cast<std::chrono::milliseconds>(end_main - start_main).count() << " ms\n";
+    auto end_main = system_clock::now();
+    std::cout << "\n[Execution Engine] Total pipeline execution time: " 
+              << duration_cast<milliseconds>(end_main - start_main).count() << " ms\n";
 
     return summary_results;
 }
 
 /**
- * @brief Main entry point executing batch testing and exporting CSV telemetry.
+ * @brief Automated Test Engine and Micro-level Profiler
+ * 
+ * @note Operates the core optimization routines and manages I/O serialization
+ *       for specific pathological network topologies (e.g., Scenario D).
+ * @return int Standard exit code.
  */
 int main() {
-    std::string graph_file = R"(..\data\data_d2d\graph_N60_K15.csv)";
-    std::string demand_file = R"(..\data\data_d2d\demand_N60_K15.csv)";
-
-    std::ofstream outfile(R"(..\data\data_d2d\experiment_results.csv)");
-    outfile << "Group,Alpha,Stress,Algorithm,Obj,T_max,E_total,F_gap,Active_Links,Multipath_Count,EE(Mbits/J),JFI,Avg_Congestion,Iteration,Time_ms\n";
-
-    // --- Experiment Set 1: Network Stress Testing ---
-    std::cout << "\n>>>>>>>>>> Starting Group 1: Stress Testing <<<<<<<<<<\n";
-    std::vector<double> stress_factors = { 1.0, 3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0 }; 
-
-    for (double stress : stress_factors) {
-        auto results = run_single_experiment(graph_file, demand_file, stress, 0.5);
-        for (const auto& res : results) {
-            outfile << "Stress_Test,0.5," << stress << "," << res.name << ","
-                << res.best_objective << "," << res.max_delay << "," << res.total_energy << "," << res.objective_difference << ","
-                << res.active_links << "," << res.multipath_count << ","
-                << res.energy_efficiency << "," << res.jain_fairness_index << "," << res.avg_link_delay << ","
-                << res.iter << "," << res.time_ms << "\n"; 
-        }
-    }
-
-    // --- Experiment Set 2: Pareto Frontier Trade-offs ---
-    std::cout << "\n>>>>>>>>>> Starting Group 2: Pareto Trade-off <<<<<<<<<<\n";
-    std::vector<double> alphas = { 0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99 }; 
-
-    for (double alpha : alphas) {
-        auto results = run_single_experiment(graph_file, demand_file, 5.0, alpha);
-        for (const auto& res : results) {
-            if (res.name == "BCD-FW" || res.name == "BCD-IPM") {
-                outfile << "Pareto," << alpha << ",5.0," << res.name << ","
-                    << res.best_objective << "," << res.max_delay << "," << res.total_energy << "," << res.objective_difference << ","
-                    << res.active_links << "," << res.multipath_count << ","
-                    << res.energy_efficiency << "," << res.jain_fairness_index << "," << res.avg_link_delay << ","
-                    << res.iter << "," << res.time_ms << "\n"; 
-            }
-        }
-    }
-    outfile.close();
-
     // ==================================================================================
-    // Export Convergence History 
+    // Scenario D: Micro-level Profiling & Pathological Case Study Execution
     // ==================================================================================
-    std::cout << "\n>>> Saving convergence history to convergence_log.csv...\n";
-    std::ofstream conv_file(R"(..\data\data_d2d\convergence_log.csv)");
-    conv_file << "Scenario,Algorithm,Iteration,Obj,T_max,E_total,F_gap\n";
-
-    double conv_stress = 5.0;
-    double conv_alpha = 0.5;
-    auto conv_results = run_single_experiment(graph_file, demand_file, conv_stress, conv_alpha);
-
-    for (const auto& res : conv_results) {
-        if (res.name == "BCD-FW" || res.name == "BCD-IPM") {
-            for (size_t i = 0; i < res.history_objective.size(); ++i) {
-                conv_file << "Stress_" << conv_stress << "_Alpha_" << conv_alpha << ","
-                    << res.name << "," << (i + 1) << "," 
-                    << res.history_objective[i] << ","
-                    << res.history_delay[i] << ","
-                    << res.history_energy[i] << "\n";
-                if (i < res.history_diff.size()) {
-                    conv_file << res.history_diff[i] << ",";
-                }
-                else {
-                    conv_file << "0,"; 
-                }
-            }
-        }
-    }
-
-    conv_file.close();
-    std::cout << ">>> Convergence history saved successfully!\n";
-    std::cout << "\n [SUCCESS] All experiments completed! Data saved to 'experiment_results.csv'.\n";
+    std::cout << "\n================================================================================\n";
+    std::cout << ">>> INITIATING SCENARIO D: Micro-level Profiling Pipeline\n";
+    std::cout << "================================================================================\n";
     
+    const double test_alpha_weight = 0.4;
+    const double test_stress_multiplier = 5.0;
+    
+    int target_topology_id = 10;
+    std::string file_suffix = "_Boxplot_ID" + std::to_string(target_topology_id) + ".csv";
+    std::string case_graph_path = "../data/data_d2d/box_generator/graph_ScenC" + file_suffix;
+    std::string case_demand_path = "../data/data_d2d/box_generator/demand_ScenC" + file_suffix;
+
+    std::cout << ">>> [Case Study] Loading Topology " << target_topology_id << " from physical storage...\n";
+
+    std::vector<AlgoResult> case_results = run_single_experiment(case_graph_path, case_demand_path, test_stress_multiplier, test_alpha_weight);
+
+    Col_gen case_graph_structure(case_graph_path);
+
+    std::vector<std::tuple<size_t, size_t, double>> target_traffic_demands = Get_demand(case_demand_path);
+    for (auto& demand : target_traffic_demands) {
+        std::get<2>(demand) *= test_stress_multiplier; 
+    }
+    
+    if (case_results.empty()) {
+        std::cerr << ">>> [ERROR] Profiling pipeline failed. Verify existence of Topology " << target_topology_id << ".\n";
+    } else {
+        const double total_system_bandwidth = 100.0;
+        std::string microscopic_analysis_file = R"(..\data\data_d2d\box_generator\detailed_path_analysis.csv)";
+
+        for (const auto& res : case_results) {
+            std::map<Link, double> eval_capacity_map, eval_power_map, eval_lambda_map;
+            for (size_t i = 0; i < case_graph_structure.edge_list.size(); ++i) {
+                Link current_link = { 
+                    static_cast<int>(std::get<0>(case_graph_structure.edge_list[i])), 
+                    static_cast<int>(std::get<1>(case_graph_structure.edge_list[i])) 
+                };
+                eval_capacity_map[current_link] = (res.final_r_opt.size() > i) ? res.final_r_opt[i] : 0.0;
+                eval_power_map[current_link] = (res.final_p_opt.size() > i) ? res.final_p_opt[i] : 0.0;
+                eval_lambda_map[current_link] = (res.final_l_opt.size() > i) ? res.final_l_opt[i] : 0.0;
+            }
+
+            export_commodity_path_details(
+                microscopic_analysis_file,
+                res.name,
+                target_traffic_demands,
+                res.final_x_flow,
+                eval_capacity_map,
+                eval_power_map,
+                eval_lambda_map,
+                total_system_bandwidth 
+            );
+        }
+    }
+
     return 0;
 }
