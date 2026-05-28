@@ -1,0 +1,107 @@
+#include <algorithm>
+#include <cstddef>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "graph.h"
+
+/**
+ * @brief Exports detailed micro-level telemetry for multi-commodity flows and physical resource allocations to a CSV file.
+ * * @param file_path The destination CSV file path.
+ * @param algorithm_name Identifier for the algorithm producing the results (e.g., "BCD-IPM", "Game-Greedy").
+ * @param commodity_demands Traffic demand matrix specifying source, destination, and volume.
+ * @param flow_routing_matrix The computed flow routing fractions across active links.
+ * @param rate_capacities The physical rate capacities (Mbps) assigned to links.
+ * @param power_allocations The transmission power (Watts) assigned to links.
+ * @param bandwidth_allocations The spectrum bandwidth (MHz) assigned to links.
+ * @param total_bandwidth_mhz The physical limit of total available spectrum in the system.
+ * * @note Operates in append mode (std::ios::app) to seamlessly aggregate reports from multiple 
+ * algorithms into a single file. Implements a strict bandwidth audit (Scale-Down Mechanism) 
+ * prior to calculating the actual transmission delays.
+ */
+void export_commodity_path_details(
+    const std::string& file_path,
+    const std::string& algorithm_name,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& flow_routing_matrix,
+    const std::map<Link, double>& rate_capacities,
+    const std::map<Link, double>& power_allocations,
+    const std::map<Link, double>& bandwidth_allocations,
+    double total_bandwidth_mhz
+) {
+    // Utilize append mode to support serial logging of multiple algorithms
+    std::ofstream case_file(file_path, std::ios::app);
+
+    if (!case_file.is_open()) {
+        std::cerr << "[Fatal Error] Failed to open Case Study export file: " << file_path << "\n";
+        return;
+    }
+
+    // Intelligent Header Injection: Write header only if the file is newly created
+    case_file.seekp(0, std::ios::end);
+    if (case_file.tellp() == std::streampos(0)) {
+        case_file << "Algorithm,Commodity_ID,Cmd_Src,Cmd_Dst,Total_Demand(Mbits),Edge_Src,Edge_Dst,"
+                  << "Route_Fraction,Actual_Flow(Mbits),Power(W),Bandwidth(MHz),Nominal_Rate(Mbps),"
+                  << "Actual_Rate_Scaled(Mbps),Edge_Delay(s)\n";
+    }
+
+    // =========================================================
+    // 1. Physical Conservation & Anti-Over-allocation Audit
+    // =========================================================
+    double total_allocated_bandwidth = 0.0;
+    for (const auto& pair : bandwidth_allocations) {
+        total_allocated_bandwidth += pair.second;
+    }
+    
+    double capacity_scale_factor = (total_allocated_bandwidth > total_bandwidth_mhz) 
+                                   ? (total_bandwidth_mhz / std::max(total_allocated_bandwidth, 1e-9)) 
+                                   : 1.0;
+
+    // =========================================================
+    // 2. Micro-level Telemetry Extraction
+    // =========================================================
+    for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+        double traffic_volume = std::get<2>(commodity_demands[k]);
+        int commodity_source = static_cast<int>(std::get<0>(commodity_demands[k]));
+        int commodity_target = static_cast<int>(std::get<1>(commodity_demands[k]));
+
+        // Traverse all activated edges for commodity flow k
+        for (const auto& pair : flow_routing_matrix[k]) {
+            double routing_fraction = pair.second;
+            double actual_flow_volume = routing_fraction * traffic_volume;
+
+            // Data Cleaning: Filter out infinitesimal numerical dust (e.g., from IPM barrier methods)
+            if (actual_flow_volume < 1e-4) {
+                continue;
+            }
+
+            Link current_link = pair.first;
+
+            // Safely extract resource allocations with boundary protection
+            double allocated_power = power_allocations.count(current_link) ? power_allocations.at(current_link) : 0.0;
+            double allocated_bandwidth = bandwidth_allocations.count(current_link) ? bandwidth_allocations.at(current_link) : 0.0;
+            double nominal_rate = rate_capacities.count(current_link) ? rate_capacities.at(current_link) : 0.0;
+
+            // Audit Strike: Compute the true rate subjected to the scale-down penalty
+            double actual_scaled_rate = nominal_rate * capacity_scale_factor;
+            actual_scaled_rate = std::max(actual_scaled_rate, 1e-9); // Zero-division protection
+
+            // Compute strict physical delay on the edge
+            double edge_transmission_delay = actual_flow_volume / actual_scaled_rate;
+
+            // Flush telemetry to disk
+            case_file << algorithm_name << ","
+                      << k << "," << commodity_source << "," << commodity_target << "," << traffic_volume << ","
+                      << current_link.first << "," << current_link.second << ","
+                      << routing_fraction << "," << actual_flow_volume << ","
+                      << allocated_power << "," << allocated_bandwidth << ","
+                      << nominal_rate << "," << actual_scaled_rate << "," << edge_transmission_delay << "\n";
+        }
+    }
+    
+    case_file.close();
+}
