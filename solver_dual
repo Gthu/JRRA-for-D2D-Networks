@@ -1,770 +1,1153 @@
-#include "solver_dual.h"
-#include <functional>
-#include <vector>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <numeric>
-#include <queue>
-#include <set>
+#include <random>
+#include <tuple>
+#include <vector>
+
+#include "optimization_solvers.h" // Updated to match our standardized header name
+#include "graph.h"
+
+// =========================================================
+// Mathematical Utilities
+// =========================================================
 
 constexpr double kDualEpsilon = 1e-9;
 
 /**
- * @brief Projects a dual variable vector onto a simplex manifold.
- * 
- * @param input_vector The input vector to be projected (e.g., delay shadow prices).
- * @param target_sum The target sum of the projected vector elements (alpha tradeoff).
- * @return std::vector<double> The projected vector satisfying the sum and non-negativity constraints.
- * 
- * @note Time Complexity: O(K log K) due to the sorting step, where K is the vector dimension.
- * Solves the minimization problem: min ||x - y||^2 subject to sum(x) = target_sum, x >= 0.
+ * @brief Performs Euclidean projection onto a scaled simplex.
+ * Minimizes ||x - y||^2 subject to sum(x) = alpha, x >= 0.
+ * @param target_vector The vector y to be projected.
+ * @param simplex_scale The sum constraint alpha.
+ * @return std::vector<double> The projected vector x.
+ * @note Utilized within Lagrangian Dual Decomposition to enforce sum constraints 
+ * on dual variables (e.g., path delays) while maintaining non-negativity.
+ * Time complexity is O(K log K) due to the sorting step, where K is the vector dimension.
  */
-std::vector<double> project_simplex(std::vector<double>& input_vector, double target_sum) {
-    int dimension = static_cast<int>(input_vector.size());
-    if (dimension == 0) return {};
+std::vector<double> project_simplex(std::vector<double>& target_vector, double simplex_scale) {
+    int dim = target_vector.size();
+    if (dim == 0) return {};
 
-    std::vector<double> sorted_vector = input_vector;
-    std::sort(sorted_vector.begin(), sorted_vector.end(), std::greater<double>());
+    std::vector<double> sorted_u = target_vector;
+    // 1. Sort in descending order
+    std::sort(sorted_u.begin(), sorted_u.end(), std::greater<double>());
 
+    // 2. Find the pivot index rho
     int rho = -1;
-    double running_sum = 0.0;
-    for (int i = 0; i < dimension; ++i) {
-        running_sum += sorted_vector[i];
-        double threshold = sorted_vector[i] + (1.0 / (i + 1)) * (target_sum - running_sum);
-        if (threshold > 0) rho = i;
+    double cumulative_sum = 0.0;
+    for (int i = 0; i < dim; ++i) {
+        cumulative_sum += sorted_u[i];
+        double root_test = sorted_u[i] + (1.0 / (i + 1)) * (simplex_scale - cumulative_sum);
+        if (root_test > 0) {
+            rho = i;
+        }
     }
 
-    double theta = 0.0;
-    double sum_up_to_rho = 0.0;
-    for (int i = 0; i <= rho; ++i) sum_up_to_rho += sorted_vector[i];
-    theta = (1.0 / (rho + 1)) * (target_sum - sum_up_to_rho);
-
-    std::vector<double> projected_vector(dimension);
-    for (int i = 0; i < dimension; ++i) {
-        projected_vector[i] = std::max(0.0, input_vector[i] + theta);
+    // 3. Compute the Lagrange multiplier theta
+    double sum_rho = 0.0;
+    for (int i = 0; i <= rho; ++i) {
+        sum_rho += sorted_u[i];
     }
-    return projected_vector;
+    double theta = (1.0 / (rho + 1)) * (simplex_scale - sum_rho);
+
+    // 4. Project and enforce non-negativity
+    std::vector<double> projected_x(dim);
+    for (int i = 0; i < dim; ++i) {
+        projected_x[i] = std::max(0.0, target_vector[i] + theta);
+    }
+    
+    return projected_x;
 }
 
+// =========================================================
+// Dual Decomposition Solvers (Part 1)
+// =========================================================
+
 /**
- * @brief Solves the physical link resource allocation subproblem via Coordinate Descent.
- * 
- * @param bandwidth_opt [out] Optimized bandwidth allocation for the link.
- * @param delay_opt [out] Optimized transmission delay for the link.
- * @param data_demand_mb Total data volume traversing the link.
- * @param channel_snr_gain Pre-calculated safe SNR gain (h / N0) to prevent division by zero.
- * @param price_bandwidth Lagrangian dual variable for the system bandwidth constraint.
- * @param price_power Lagrangian dual variable for the node power constraint.
- * @param price_delay Lagrangian dual variable for the aggregated delay constraint.
- * @param max_power_limit Absolute physical hardware ceiling for transmission power.
- * @param alpha_tradeoff System parameter balancing energy and delay objectives.
- * @param system_tolerance Numerical tolerance to prevent floating-point underflow.
- * 
- * @note Optimizes the Lagrangian function Phi_ij(l, t) iteratively. Implements hard 
- * power clamping and exponential bounding to prevent numerical overflow in Shannon capacity inversions.
+ * @brief Solves the physical link sub-problem for bandwidth and time allocations via Coordinate Descent.
+ * @note Optimizes the localized Lagrangian function Phi_ij(l, t). Reduces computational overhead 
+ * by terminating after 3 iterations, sufficient for convergence under the Primal-Dual Algorithm framework.
  */
 void solve_link_subproblem(
-    double& bandwidth_opt, double& delay_opt, 
-    double data_demand_mb, double channel_snr_gain,
-    double price_bandwidth, double price_power, double price_delay,
-    double max_power_limit, double alpha_tradeoff, double system_tolerance
+    double& optimal_bandwidth, 
+    double& optimal_time,
+    double traffic_demand_ij,
+    double channel_snr_gain,
+    double dual_multiplier_lambda,
+    double internal_penalty_sigma,
+    double dual_multiplier_lambda_ij,
+    double node_max_power,
+    double fairness_alpha,
+    double convergence_epsilon,
+    double total_system_bandwidth_mhz 
 ) {
-    const double kMinVariableThreshold = 1e-3;
-    bandwidth_opt = std::max(bandwidth_opt, kMinVariableThreshold);
-    delay_opt = std::max(delay_opt, kMinVariableThreshold);
+    constexpr double kMinResourceVariance = 1e-3;
+    optimal_bandwidth = std::max(optimal_bandwidth, kMinResourceVariance);
+    optimal_time = std::max(optimal_time, kMinResourceVariance);
 
-    double power_penalty_coeff = system_tolerance + price_power;
-    double energy_weight = 1.0 - alpha_tradeoff;
-    double inverse_snr_gain = 1.0 / channel_snr_gain; 
+    double power_penalty_coeff = convergence_epsilon + internal_penalty_sigma;
+    double energy_weight = 1.0 - fairness_alpha;
+    double inverse_snr_gain = 1.0 / channel_snr_gain;
 
-    // Coordinate descent macro-loop
-    for (int iter = 0; iter < 10; ++iter) {
+    // Coordinate Descent: Fast convergence threshold set to 3 iterations
+    for (int iter = 0; iter < 3; ++iter) {
 
-        // --- Step A: Optimize Bandwidth (delay fixed) ---
+        // ==========================================
+        // --- Step A: Optimize Bandwidth (l) holding Time (t) constant ---
+        // ==========================================
         {
-            double search_low = kMinVariableThreshold, search_high = 50.0;
-            for (int bin = 0; bin < 30; ++bin) {
-                double mid = (search_low + search_high) / 2.0;
-                double current_bandwidth = mid;
+            double search_low = kMinResourceVariance;
+            // Adaptive search ceiling bounded by physical spectrum to prevent numerical overflows
+            double search_high = std::max(total_system_bandwidth_mhz * 2.0, 100.0);
 
-                double shannon_exponent = data_demand_mb / (current_bandwidth * delay_opt);
+            for (int bin = 0; bin < 35; ++bin) { 
+                double mid_bandwidth = (search_low + search_high) / 2.0;
+                double current_exponent = traffic_demand_ij / (mid_bandwidth * optimal_time);
 
-                // Defense 1: Prevent exponent overflow
-                if (shannon_exponent > 50.0) {
-                    search_low = mid; 
+                // Math Defense 1: Prevent std::pow catastrophic overflow
+                if (current_exponent > 50.0) {
+                    search_low = mid_bandwidth;
                     continue;
                 }
 
-                double exponential_term = std::pow(2.0, shannon_exponent);
-                double actual_power = current_bandwidth * inverse_snr_gain * (exponential_term - 1.0);
+                double exponential_term = std::pow(2.0, current_exponent);
+                double required_power = mid_bandwidth * inverse_snr_gain * (exponential_term - 1.0);
 
-                // Defense 2: Hard physical power clamping
-                if (actual_power > max_power_limit) {
-                    search_low = mid; 
+                // Math Defense 2: Strict Power Clamping 
+                if (required_power > node_max_power) {
+                    search_low = mid_bandwidth;
                     continue;
                 }
 
-                double power_derivative = inverse_snr_gain * (exponential_term - 1.0 - shannon_exponent * std::log(2.0) * exponential_term);
-                double objective_derivative = power_derivative * (energy_weight * delay_opt + power_penalty_coeff) + price_bandwidth;
+                double dP_dl = inverse_snr_gain * (exponential_term - 1.0 - current_exponent * std::log(2.0) * exponential_term);
+                double derivative = dP_dl * (energy_weight * optimal_time + power_penalty_coeff) + dual_multiplier_lambda;
 
-                if (objective_derivative > 0) search_high = mid;
-                else search_low = mid;
+                if (derivative > 0) {
+                    search_high = mid_bandwidth;
+                } else {
+                    search_low = mid_bandwidth;
+                }
             }
-            bandwidth_opt = (search_low + search_high) / 2.0;
+            optimal_bandwidth = (search_low + search_high) / 2.0;
         }
-        
-        // --- Step B: Optimize Delay (bandwidth fixed) ---
+
+        // ==========================================
+        // --- Step B: Optimize Time (t) holding Bandwidth (l) constant ---
+        // ==========================================
         {
-            double kMaxQosDelay = 50.0; 
+            constexpr double kMaxQosDelay = 100.0; 
 
-            double max_achievable_snr = (max_power_limit * channel_snr_gain) / bandwidth_opt;
-            double max_shannon_rate = bandwidth_opt * std::log2(1.0 + max_achievable_snr);
+            double max_snr = (node_max_power * channel_snr_gain) / optimal_bandwidth;
+            double max_rate = optimal_bandwidth * std::log2(1.0 + max_snr);
 
-            double absolute_min_delay = (max_shannon_rate > 1e-9) ? (data_demand_mb / max_shannon_rate) : 99999.0;
+            double physical_min_time = (max_rate > 1e-9) ? (traffic_demand_ij / max_rate) : 99999.0;
 
-            double search_low = absolute_min_delay;
-            double search_high = std::max(absolute_min_delay, kMaxQosDelay);
+            double search_low = physical_min_time;
+            double search_high = std::max(physical_min_time, kMaxQosDelay);
 
             if (search_high - search_low < 1e-4) {
-                delay_opt = search_high;
+                optimal_time = search_high;
             } else {
                 for (int bin = 0; bin < 35; ++bin) {
-                    double mid = (search_low + search_high) / 2.0;
-                    double current_delay = mid;
+                    double mid_time = (search_low + search_high) / 2.0;
+                    double current_exponent = traffic_demand_ij / (optimal_bandwidth * mid_time);
 
-                    double shannon_exponent = data_demand_mb / (bandwidth_opt * current_delay);
-                    double exponential_term = std::pow(2.0, shannon_exponent);
-                    double actual_power = bandwidth_opt * inverse_snr_gain * (exponential_term - 1.0);
+                    double exponential_term = std::pow(2.0, current_exponent);
+                    double required_power = optimal_bandwidth * inverse_snr_gain * (exponential_term - 1.0);
 
-                    if (actual_power > max_power_limit) {
-                        search_low = mid; 
+                    if (required_power > node_max_power) {
+                        search_low = mid_time;
                         continue;
                     }
 
-                    double power_time_derivative = -(inverse_snr_gain * data_demand_mb * std::log(2.0) / (current_delay * current_delay)) * exponential_term;
-                    double energy_time_derivative = inverse_snr_gain * bandwidth_opt * (exponential_term - 1.0 - shannon_exponent * std::log(2.0) * exponential_term);
-                    double objective_derivative = energy_weight * energy_time_derivative + power_penalty_coeff * power_time_derivative + price_delay;
+                    double dP_dt = -(inverse_snr_gain * traffic_demand_ij * std::log(2.0) / (mid_time * mid_time)) * exponential_term;
+                    double dE_dt = inverse_snr_gain * optimal_bandwidth * (exponential_term - 1.0 - current_exponent * std::log(2.0) * exponential_term);
+                    double objective_derivative = energy_weight * dE_dt + power_penalty_coeff * dP_dt + dual_multiplier_lambda_ij;
 
-                    if (objective_derivative > 0) search_high = mid;
-                    else search_low = mid;
+                    if (objective_derivative > 0) {
+                        search_high = mid_time;
+                    } else {
+                        search_low = mid_time;
+                    }
                 }
-                delay_opt = (search_low + search_high) / 2.0;
+                optimal_time = (search_low + search_high) / 2.0;
             }
         }
     }
 }
 
-/**
- * @brief Equal Resource Allocation (Baseline) & DAG Longest-Path Evaluation.
- * 
- * @param edge_list Tuple list defining the physical topology.
- * @param traffic_demands Tuple list defining commodity traffic flows.
- * @param flow_fractions Routing distributions.
- * @param total_bandwidth_spectrum System-wide spectrum budget.
- * @param max_power_per_node Max available transmission power per node.
- * @param noise_power_dbm_per_mhz Noise spectral density.
- * @return OptimizationResult Structure containing statically allocated resources and topological delays.
- */
-OptimizationResult run_static_equal_allocation(
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list, 
-    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
-    const std::vector<std::map<Link, double>>& flow_fractions,
-    double total_bandwidth_spectrum,
-    double max_power_per_node,
-    double noise_power_dbm_per_mhz
-) {
-    OptimizationResult baseline_result;
+// =========================================================
+// Game-Theoretic Greedy Baseline (Resource Allocation Only)
+// =========================================================
 
-    std::set<Link> active_edges;
-    std::map<int, int> node_out_degree;
+OptimizationResult run_game_greedy_allocation(
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list,
+    int num_nodes,
+    const std::vector<double>& node_max_powers,
+    double total_bandwidth_mhz,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& current_flow_routing, 
+    double noise_density_dbm_per_mhz
+) {
+    OptimizationResult result;
+    std::size_t num_edges = edge_list.size();
+    std::size_t num_flows = commodity_demands.size();
     
-    for (size_t k = 0; k < traffic_demands.size(); ++k) {
-        for (const auto& pair : flow_fractions[k]) {
-            if (pair.second > 1e-6) {
-                active_edges.insert(pair.first);
+    double noise_power_spectral_density_w_mhz = std::pow(10.0, (noise_density_dbm_per_mhz - 30.0) / 10.0);
+    constexpr double kEps = 1e-9;
+
+    // ==========================================
+    // 1. Graph Topology & O(1) Index Mapping
+    // ==========================================
+    std::vector<std::vector<std::pair<int, int>>> adjacency_indices(num_nodes);
+    std::vector<double> channel_gains(num_edges);
+    std::vector<int> out_degrees(num_nodes, 0);
+    std::map<Link, int> link_to_index_map; 
+
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        int u = static_cast<int>(std::get<0>(edge_list[e]));
+        int v = static_cast<int>(std::get<1>(edge_list[e]));
+        Link current_link = { u, v };
+        
+        link_to_index_map[current_link] = static_cast<int>(e);
+        adjacency_indices[u].push_back({ v, static_cast<int>(e) });
+        out_degrees[u]++;
+
+        double distance_meters = std::get<2>(edge_list[e]);
+        double distance_km = std::max(0.001, distance_meters / 1000.0);
+        double path_loss_db = 128.1 + 37.6 * std::log10(distance_km);
+        channel_gains[e] = std::pow(10.0, -path_loss_db / 10.0);
+    }
+
+    // ==========================================
+    // 2. Physical Traffic Compilation 
+    // ==========================================
+    std::vector<double> actual_flow_volumes(num_edges, 0.0);
+    int active_edge_count = 0;
+
+    for (std::size_t k = 0; k < num_flows; ++k) {
+        double traffic_volume = std::get<2>(commodity_demands[k]);
+        for (const auto& pair : current_flow_routing[k]) {
+            if (pair.second > 1e-5 && link_to_index_map.count(pair.first)) {
+                int e = link_to_index_map[pair.first];
+                actual_flow_volumes[e] += pair.second * traffic_volume;
             }
         }
     }
-    for (const auto& l : active_edges) {
-        node_out_degree[l.first]++;
+
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        if (actual_flow_volumes[e] > kEps) {
+            active_edge_count++;
+        }
     }
 
-    double equal_bandwidth = active_edges.empty() ? 0.0 : total_bandwidth_spectrum / active_edges.size();
+    // ==========================================
+    // 3. Heuristic Resource Initialization 
+    // ==========================================
+    std::vector<double> power_vector(num_edges, 0.0);
+    std::vector<double> bandwidth_vector(num_edges, kEps); 
 
-    baseline_result.l_opt.resize(edge_list.size(), 0.0);
-    baseline_result.p_opt.resize(edge_list.size(), 0.0);
-    baseline_result.r_opt.resize(edge_list.size(), 0.0);
+    // Target bandwidth allocation exclusively to active edges
+    double bandwidth_per_active_edge = (active_edge_count > 0) ? (total_bandwidth_mhz / active_edge_count) : 0.0;
 
-    double noise_psd_w_mhz = std::pow(10.0, (noise_power_dbm_per_mhz - 30.0) / 10.0);
-    double total_noise_power = noise_psd_w_mhz * equal_bandwidth;
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        int u = static_cast<int>(std::get<0>(edge_list[e]));
+        if (actual_flow_volumes[e] > kEps) {
+            bandwidth_vector[e] = bandwidth_per_active_edge;
+            power_vector[e] = node_max_powers[u] / std::max(1, out_degrees[u]);
+        }
+    }
 
-    for (size_t i = 0; i < edge_list.size(); ++i) {
+    // ==========================================
+    // 4. Iterative Potential Game (Localized Power Swapping)
+    // ==========================================
+    auto eval_total_delay = [&]() -> double {
+        double sum_delay = 0.0;
+        for (std::size_t e = 0; e < num_edges; ++e) {
+            if (actual_flow_volumes[e] > kEps) {
+                double snr = (power_vector[e] * channel_gains[e]) / (noise_power_spectral_density_w_mhz * bandwidth_vector[e]);
+                double capacity = bandwidth_vector[e] * std::log2(1.0 + snr);
+                sum_delay += actual_flow_volumes[e] / std::max(capacity, kEps);
+            }
+        }
+        return sum_delay;
+    };
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> rand_ratio(0.05, 0.3);
+
+    double current_objective = eval_total_delay();
+    
+    for (int iter = 0; iter < 50; ++iter) {
+        bool globally_improved = false;
+        for (int u = 0; u < num_nodes; ++u) {
+            std::vector<int> node_active_edges;
+            for (const auto& edge : adjacency_indices[u]) {
+                if (actual_flow_volumes[edge.second] > kEps) {
+                    node_active_edges.push_back(edge.second);
+                }
+            }
+            if (node_active_edges.size() >= 2) {
+                int e1 = node_active_edges[rng() % node_active_edges.size()];
+                int e2 = node_active_edges[rng() % node_active_edges.size()];
+                if (e1 == e2) continue;
+
+                double power_delta = power_vector[e1] * rand_ratio(rng);
+                power_vector[e1] -= power_delta;
+                power_vector[e2] += power_delta;
+
+                double new_objective = eval_total_delay();
+                if (new_objective < current_objective - 1e-5) {
+                    current_objective = new_objective;
+                    globally_improved = true;
+                } else {
+                    // Revert 
+                    power_vector[e1] += power_delta;
+                    power_vector[e2] -= power_delta;
+                }
+            }
+        }
+        if (!globally_improved) break;
+    }
+
+    // ==========================================
+    // 5. Finalize Shannon Capacity Resolutions
+    // ==========================================
+    std::vector<double> rate_vector(num_edges, kEps);
+    std::map<Link, double> rate_map;
+    std::map<Link, double> power_map;
+    std::map<Link, double> bandwidth_map;
+
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        Link current_link = { static_cast<int>(std::get<0>(edge_list[e])), static_cast<int>(std::get<1>(edge_list[e])) };
+        if (actual_flow_volumes[e] > kEps) {
+            double snr = (power_vector[e] * channel_gains[e]) / (noise_power_spectral_density_w_mhz * bandwidth_vector[e]);
+            rate_vector[e] = std::max(bandwidth_vector[e] * std::log2(1.0 + snr), kEps);
+        }
+        rate_map[current_link] = rate_vector[e];
+        power_map[current_link] = power_vector[e];
+        bandwidth_map[current_link] = bandwidth_vector[e];
+    }
+
+    // ==========================================
+    // 6. Invoke Global Arbiter (evaluate_network_state)
+    // ==========================================
+    auto [final_max_delay, final_sum_delay, final_total_energy, final_delays] = evaluate_network_state(
+        commodity_demands, current_flow_routing, rate_map, power_map, bandwidth_map, total_bandwidth_mhz, num_nodes
+    );
+    
+    // ==========================================
+    // 7. Assemble OptimizationResult
+    // ==========================================
+    result.optimal_bandwidths = bandwidth_vector;
+    result.optimal_powers = power_vector;
+    result.optimal_rates = rate_vector;
+    
+    result.optimal_transmission_times.resize(num_edges, 0.0);
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        result.optimal_transmission_times[e] = actual_flow_volumes[e] / rate_vector[e];
+    }
+
+    result.max_end_to_end_delay = final_max_delay;
+    result.max_expected_sum_delay = final_sum_delay;
+    result.total_system_energy = final_total_energy;
+    result.commodity_max_delays = std::move(final_delays);
+    
+    return result;
+}
+
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <iostream>
+#include <map>
+#include <queue>
+#include <set>
+#include <tuple>
+#include <vector>
+
+#include "optimization_solvers.h"
+#include "graph.h"
+
+// ==============================================================================
+// Static Equal Allocation Baseline & SPFA DAG Delay Evaluation
+// ==============================================================================
+
+/**
+ * @brief Executes a static, uniform resource allocation baseline and evaluates end-to-end delays.
+ * @param edge_list Master list of network edges representing physical topology.
+ * @param commodity_demands Traffic demand matrix specifying source, destination, and volume.
+ * @param current_flow_routing The pre-computed flow routing matrix to be evaluated.
+ * @param total_bandwidth_mhz Total available spectrum bandwidth in the system.
+ * @param max_power_per_node Maximum transmission power constraint per node.
+ * @param noise_density_dbm_per_mhz Additive White Gaussian Noise (AWGN) power spectral density.
+ * @return OptimizationResult Structure encapsulating the uniform allocations and evaluated system metrics.
+ * @note This module functions as a "dumb" baseline, evenly distributing bandwidth among all active links 
+ * and splitting node power uniformly across active outgoing edges. End-to-end maximum delays are rigorously 
+ * audited using a Shortest Path Faster Algorithm (SPFA) topological sort to detect and penalize routing loops.
+ */
+OptimizationResult run_static_equal_allocation(
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list, 
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& current_flow_routing,
+    double total_bandwidth_mhz,
+    double max_power_per_node,
+    double noise_density_dbm_per_mhz
+) {
+    OptimizationResult result;
+
+    // =========================================================
+    // 1. Topology Activation Census
+    // =========================================================
+    std::set<Link> active_network_edges;
+    std::map<int, int> node_out_degrees;
+    
+    for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+        for (const auto& pair : current_flow_routing[k]) {
+            if (pair.second > 1e-6) {
+                active_network_edges.insert(pair.first);
+            }
+        }
+    }
+    
+    for (const auto& link : active_network_edges) {
+        node_out_degrees[link.first]++;
+    }
+
+    // =========================================================
+    // 2. Uniform Bandwidth Allocation
+    // =========================================================
+    double uniform_bandwidth = active_network_edges.empty() ? 0.0 : total_bandwidth_mhz / static_cast<double>(active_network_edges.size());
+
+    // =========================================================
+    // 3. Heuristic Power Distribution & Shannon Capacity
+    // =========================================================
+    result.optimal_bandwidths.resize(edge_list.size(), 0.0);
+    result.optimal_powers.resize(edge_list.size(), 0.0);
+    result.optimal_rates.resize(edge_list.size(), 0.0);
+
+    double noise_power_spectral_density_w_mhz = std::pow(10.0, (noise_density_dbm_per_mhz - 30.0) / 10.0);
+    double total_noise_power_watts = noise_power_spectral_density_w_mhz * uniform_bandwidth;
+
+    for (std::size_t i = 0; i < edge_list.size(); ++i) {
         Link current_link = { static_cast<int>(std::get<0>(edge_list[i])), static_cast<int>(std::get<1>(edge_list[i])) };
 
-        if (active_edges.count(current_link)) {
-            double equal_power = max_power_per_node / node_out_degree[current_link.first];
+        if (active_network_edges.count(current_link)) {
+            double uniform_power = max_power_per_node / static_cast<double>(node_out_degrees[current_link.first]);
 
+            // --- Physical Layer Computations ---
             double distance_meters = std::get<2>(edge_list[i]);
             double distance_km = std::max(0.001, distance_meters / 1000.0);
 
             double path_loss_db = 128.1 + 37.6 * std::log10(distance_km);
             double channel_gain = std::pow(10.0, -path_loss_db / 10.0);
 
-            double shannon_rate = 0.0;
-            if (total_noise_power > 1e-15) {
-                double snr = (equal_power * channel_gain) / total_noise_power;
-                shannon_rate = equal_bandwidth * std::log2(1.0 + snr);
+            double link_capacity_mbps = 0.0;
+            
+            // Zero-division defense: Calculate Shannon rate only if bandwidth (and thus noise power) is valid
+            if (total_noise_power_watts > 1e-15) {
+                double signal_to_noise_ratio = (uniform_power * channel_gain) / total_noise_power_watts;
+                link_capacity_mbps = uniform_bandwidth * std::log2(1.0 + signal_to_noise_ratio);
             }
 
-            baseline_result.l_opt[i] = equal_bandwidth;
-            baseline_result.p_opt[i] = equal_power;
-            baseline_result.r_opt[i] = shannon_rate;
+            result.optimal_bandwidths[i] = uniform_bandwidth;
+            result.optimal_powers[i] = uniform_power;
+            result.optimal_rates[i] = link_capacity_mbps;
         }
     }
 
     // =========================================================
-    // Topological Delay Evaluation
+    // 4. System-Wide Telemetry & SPFA Delay Auditing
     // =========================================================
     double system_max_delay = 0.0;
-    double system_total_energy = 0.0;
-    std::vector<double> physical_edge_time(edge_list.size(), 0.0);
-    std::vector<double> aggregated_edge_load(edge_list.size(), 0.0);
+    double total_system_energy = 0.0;
+    
+    std::vector<double> edge_transmission_times(edge_list.size(), 0.0);
+    std::vector<double> edge_traffic_loads(edge_list.size(), 0.0);
 
-    for (size_t i = 0; i < edge_list.size(); ++i) {
+    for (std::size_t i = 0; i < edge_list.size(); ++i) {
         Link current_link = { static_cast<int>(std::get<0>(edge_list[i])), static_cast<int>(std::get<1>(edge_list[i])) };
-        if (active_edges.count(current_link)) {
-            double total_load_ij = 0.0;
-            for (size_t k = 0; k < traffic_demands.size(); ++k) {
-                auto it = flow_fractions[k].find(current_link);
-                if (it != flow_fractions[k].end() && it->second > 1e-9) {
-                    double demand_volume = std::get<2>(traffic_demands[k]);
-                    total_load_ij += it->second * demand_volume;
+        
+        if (active_network_edges.count(current_link)) {
+            double aggregated_link_traffic = 0.0;
+            
+            for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+                auto iterator = current_flow_routing[k].find(current_link);
+                if (iterator != current_flow_routing[k].end() && iterator->second > 1e-9) {
+                    double traffic_volume = std::get<2>(commodity_demands[k]);
+                    aggregated_link_traffic += iterator->second * traffic_volume;
                 }
             }
-            aggregated_edge_load[i] = total_load_ij;
+            edge_traffic_loads[i] = aggregated_link_traffic;
 
-            double shannon_rate = baseline_result.r_opt[i];
-            double allocated_power = baseline_result.p_opt[i];
+            double allocated_rate = result.optimal_rates[i];
+            double allocated_power = result.optimal_powers[i];
 
-            if (total_load_ij > 1e-9) {
-                if (shannon_rate > 1e-9) { 
-                    double transmission_time = total_load_ij / shannon_rate;
-                    physical_edge_time[i] = transmission_time;
-                    system_total_energy += allocated_power * transmission_time;
+            if (aggregated_link_traffic > 1e-9) {
+                if (allocated_rate > 1e-9) { 
+                    double transmission_time = aggregated_link_traffic / allocated_rate;
+                    edge_transmission_times[i] = transmission_time;
+                    total_system_energy += allocated_power * transmission_time;
                 } else {
-                    physical_edge_time[i] = 99999.0;
-                    system_total_energy += allocated_power * 500.0;
+                    // Catastrophic Congestion: Traffic exists but rate is near-zero. Apply strict penalty.
+                    edge_transmission_times[i] = 99999.0;
+                    total_system_energy += allocated_power * 500.0;
                 }
             } else {
-                physical_edge_time[i] = 0.0; 
+                edge_transmission_times[i] = 0.0;
             }
         }
     }
 
-    // SPFA Topological sorting for maximum end-to-end delay
-    for (size_t k = 0; k < traffic_demands.size(); ++k) {
-        int src_node = static_cast<int>(std::get<0>(traffic_demands[k]));
-        int des_node = static_cast<int>(std::get<1>(traffic_demands[k]));
-        double demand_volume = std::get<2>(traffic_demands[k]);
+    std::vector<double> commodity_max_delays(commodity_demands.size(), 99999.0);
 
-        std::map<int, std::vector<std::pair<int, double>>> adjacency_list;
-        std::set<int> active_nodes_in_flow;
+    // Execute SPFA Topological Audit to compute exact end-to-end delays per commodity
+    for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+        int source_node = static_cast<int>(std::get<0>(commodity_demands[k]));
+        int target_node = static_cast<int>(std::get<1>(commodity_demands[k]));
+        double traffic_volume = std::get<2>(commodity_demands[k]);
 
-        for (size_t i = 0; i < edge_list.size(); ++i) {
+        std::map<int, std::vector<std::pair<int, double>>> subgraph_adjacency;
+        std::set<int> active_subgraph_nodes;
+
+        for (std::size_t i = 0; i < edge_list.size(); ++i) {
             Link current_link = { static_cast<int>(std::get<0>(edge_list[i])), static_cast<int>(std::get<1>(edge_list[i])) };
-            if (flow_fractions[k].count(current_link) && flow_fractions[k].at(current_link) > 1e-9) {
+            
+            if (current_flow_routing[k].count(current_link) && current_flow_routing[k].at(current_link) > 1e-9) {
                 int u = current_link.first;
                 int v = current_link.second;
 
-                double flow_load_on_edge = flow_fractions[k].at(current_link) * demand_volume;
-                double flow_ratio = flow_load_on_edge / aggregated_edge_load[i];
-                double fractional_transmission_time = flow_ratio * physical_edge_time[i];
+                double commodity_link_traffic = current_flow_routing[k].at(current_link) * traffic_volume;
+                double traffic_share_ratio = commodity_link_traffic / edge_traffic_loads[i];
+                double commodity_link_delay = traffic_share_ratio * edge_transmission_times[i];
 
-                adjacency_list[u].push_back({ v, fractional_transmission_time });
-                active_nodes_in_flow.insert(u);
-                active_nodes_in_flow.insert(v);
+                subgraph_adjacency[u].push_back({ v, commodity_link_delay });
+                active_subgraph_nodes.insert(u);
+                active_subgraph_nodes.insert(v);
             }
         }
 
-        if (active_nodes_in_flow.empty()) continue;
+        if (active_subgraph_nodes.empty()) continue;
 
-        // SPFA Algorithm Execution
-        std::map<int, double> arrival_time;
-        std::queue<int> node_queue;
+        // --- SPFA Loop Detection and Delay Propagation ---
+        std::map<int, double> arrival_times;
+        std::queue<int> eval_queue;
         std::map<int, bool> in_queue;
-        std::map<int, int> visit_count;
+        std::map<int, int> visit_counts;
 
-        for (int node : active_nodes_in_flow) {
-            arrival_time[node] = -1.0;
+        for (int node : active_subgraph_nodes) {
+            arrival_times[node] = -1.0;
             in_queue[node] = false;
-            visit_count[node] = 0;
+            visit_counts[node] = 0;
         }
 
-        arrival_time[src_node] = 0.0;
-        node_queue.push(src_node);
-        in_queue[src_node] = true;
-        visit_count[src_node] = 1;
+        arrival_times[source_node] = 0.0;
+        eval_queue.push(source_node);
+        in_queue[source_node] = true;
+        visit_counts[source_node] = 1;
 
-        bool has_routing_loop = false;
+        bool routing_loop_detected = false;
 
-        while (!node_queue.empty()) {
-            int u = node_queue.front();
-            node_queue.pop();
+        while (!eval_queue.empty()) {
+            int u = eval_queue.front();
+            eval_queue.pop();
             in_queue[u] = false;
 
-            for (const auto& edge : adjacency_list[u]) {
+            for (const auto& edge : subgraph_adjacency[u]) {
                 int v = edge.first;
-                double fractional_transmission_time = edge.second;
+                double delay_ij = edge.second;
 
-                if (arrival_time[u] + fractional_transmission_time > arrival_time[v] + 1e-9) {
-                    arrival_time[v] = arrival_time[u] + fractional_transmission_time;
+                if (arrival_times[u] + delay_ij > arrival_times[v] + 1e-9) {
+                    arrival_times[v] = arrival_times[u] + delay_ij;
 
                     if (!in_queue[v]) {
-                        node_queue.push(v);
+                        eval_queue.push(v);
                         in_queue[v] = true;
-                        visit_count[v]++;
+                        visit_counts[v]++;
 
-                        if (visit_count[v] > active_nodes_in_flow.size()) {
-                            has_routing_loop = true;
+                        if (visit_counts[v] > static_cast<int>(active_subgraph_nodes.size())) {
+                            routing_loop_detected = true;
                             break;
                         }
                     }
                 }
             }
-            if (has_routing_loop) break;
+            if (routing_loop_detected) break;
         }
 
-        if (has_routing_loop) {
-            std::cerr << "[Warning] Flow " << k << " (Static-Alloc) trapped in routing loop!\n";
+        // --- Destination Audit & Penalty Assessment ---
+        if (routing_loop_detected) {
+            std::cout << "[Audit Warning] Flow " << k << " (Static-Alloc) trapped in a routing loop!\n";
             system_max_delay = std::max(system_max_delay, 99999.0);
-        } else if (arrival_time.count(des_node) && arrival_time[des_node] > -0.5) {
-            double final_flow_delay = arrival_time[des_node];
-            if (final_flow_delay > system_max_delay) {
-                system_max_delay = final_flow_delay;
+            commodity_max_delays[k] = 99999.0;
+        } 
+        else if (arrival_times.count(target_node) && arrival_times[target_node] > -0.5) {
+            double final_commodity_delay = arrival_times[target_node];
+            commodity_max_delays[k] = final_commodity_delay;
+
+            if (final_commodity_delay > system_max_delay) {
+                system_max_delay = final_commodity_delay;
             }
-        } else {
-            std::cerr << "[Warning] Flow " << k << " (Static-Alloc) failed to reach destination!\n";
+        } 
+        else {
+            std::cout << "[Audit Warning] Flow " << k << " (Static-Alloc) failed to reach its destination!\n";
             system_max_delay = std::max(system_max_delay, 99999.0);
+            commodity_max_delays[k] = 99999.0;
         }
     }
 
-    baseline_result.max_delay = system_max_delay;
-    baseline_result.max_sum_delay = system_max_delay;
-    baseline_result.total_energy = system_total_energy;
+    result.max_end_to_end_delay = system_max_delay;
+    result.max_expected_sum_delay = system_max_delay; 
+    result.total_system_energy = total_system_energy;
+    result.commodity_max_delays = std::move(commodity_max_delays);
 
-    return baseline_result;
+    return result;
 }
+
+// ... [Continuing from previous part inside optimization_solvers.cpp] ...
+
+// =========================================================
+// Dual Decomposition Solvers (Part 2: Main Algorithm)
+// =========================================================
+
 /**
- * @brief Executes the Lagrangian Dual Decomposition solver for joint routing and resource allocation.
- * 
- * @param edge_list Tuple list defining the physical topology (u, v, distance).
- * @param num_nodes Total number of nodes in the network.
- * @param max_node_powers Maximum power budget constraint for each node.
- * @param total_bandwidth_mhz Total available system spectrum bandwidth in MHz.
- * @param traffic_demands Tuple list defining commodity traffic flows (src, dst, volume).
- * @param flow_fractions Routing fractions obtained from the preceding routing subproblem.
- * @param noise_power_dbm_mhz Noise power spectral density (dBm/MHz).
- * @param alpha_tradeoff Trade-off parameter balancing delay vs. energy consumption.
- * @param tolerance_epsilon Small constant for numerical stability and flow truncation.
- * @return OptimizationResult Struct containing the converged resource allocations and delay metrics.
- * 
- * @note Implements a projected subgradient descent method for dual variables (bandwidth, power, and delay shadows). 
- * The maximum congestion delay calculation utilizes a memoized Depth-First Search (DFS). To maintain strict physical 
- * accuracy within this DFS engine, the `dfs_max_delay` strictly relies on real physical edge delays (`t_ij`) rather 
- * than being diluted by theoretical flow proportions.
+ * @brief Executes the Primal-Dual Algorithm (Dual Decomposition) for distributed resource allocation.
+ * @note This is the core optimizer for Network Utility Maximization (NUM). It isolates the link-level 
+ * bandwidth/power coupling by dualizing the constraints via Shadow Prices ($\lambda, \sigma, \gamma$).
  */
 OptimizationResult run_dual_decomposition_solver(
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list,
     int num_nodes,
-    const std::vector<double>& max_node_powers,
+    const std::vector<double>& node_max_powers,
     double total_bandwidth_mhz,
-    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
-    const std::vector<std::map<Link, double>>& flow_fractions,
-    double noise_power_dbm_mhz,
-    double alpha_tradeoff,
-    double tolerance_epsilon
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& current_flow_routing,
+    double noise_density_dbm_per_mhz,
+    double fairness_alpha,
+    double convergence_epsilon
 ) {
-    int num_edges = static_cast<int>(edge_list.size());
-    int num_flows = static_cast<int>(traffic_demands.size());
-    double noise_w_mhz = std::pow(10.0, (noise_power_dbm_mhz - 30.0) / 10.0);
-
-    // =========================================================
-    // Phase 0: Pre-calculation & Memory Allocation
-    // =========================================================
-    std::vector<double> channel_gains(num_edges);
-    std::vector<double> total_link_loads(num_edges, 0.0);
-    std::vector<double> snr_gain_coefficients(num_edges, 0.0); 
-    std::vector<bool> active_edges(num_edges, false); 
+    int num_edges = edge_list.size();
+    int num_flows = commodity_demands.size();
     
-    std::vector<std::vector<std::pair<int, double>>> edge_flow_mappings(num_edges);
+    double noise_power_spectral_density_w_mhz = std::pow(10.0, (noise_density_dbm_per_mhz - 30.0) / 10.0);
+
+    // ==========================================
+    // 0. Topology Pre-computation (Performance Critical)
+    // ==========================================
+    std::vector<double> channel_gain_vector(num_edges);
+    std::vector<double> aggregate_edge_load(num_edges, 0.0);
+    std::vector<double> snr_gain_per_mhz(num_edges, 0.0); // Pre-computed H / N0
+    std::vector<bool> is_edge_active(num_edges, false); 
+    
+    // O(1) Cache: Maps each physical edge to its constituent flow fractions (rho coefficients)
+    // Pair: <commodity_id, rho_value>
+    std::vector<std::vector<std::pair<int, double>>> edge_commodity_mapping(num_edges);
 
     for (int e = 0; e < num_edges; ++e) {
-        double distance = std::get<2>(edge_list[e]);
-        double distance_km = std::max(0.001, distance / 1000.0);
+        // 1. Compute Physical Channel Dynamics (h)
+        double distance_meters = std::get<2>(edge_list[e]);
+        double distance_km = std::max(0.001, distance_meters / 1000.0);
         double path_loss_db = 128.1 + 37.6 * std::log10(distance_km);
-        channel_gains[e] = std::pow(10.0, -path_loss_db / 10.0);
+        
+        channel_gain_vector[e] = std::pow(10.0, -path_loss_db / 10.0);
+        
+        // Overflow Defense: Pre-calculate the SNR gain coefficient per MHz.
+        // Prevents extreme floating-point truncation errors deep inside the coordinate descent loops.
+        snr_gain_per_mhz[e] = channel_gain_vector[e] / noise_power_spectral_density_w_mhz;
 
-        snr_gain_coefficients[e] = channel_gains[e] / noise_w_mhz;
-
+        // 2. Aggregate Total Load (D_e) and Commodity Mapping
         int u = static_cast<int>(std::get<0>(edge_list[e]));
         int v = static_cast<int>(std::get<1>(edge_list[e]));
         Link current_link = { u, v };
 
-        double aggregate_edge_load = 0.0;
+        double edge_total_load = 0.0;
+        
         for (int k = 0; k < num_flows; ++k) {
-            auto it = flow_fractions[k].find(current_link);
-            if (it != flow_fractions[k].end()) {
-                double routing_fraction = it->second;
-                if (routing_fraction > tolerance_epsilon) {
-                    double demand_volume = std::get<2>(traffic_demands[k]);
-                    aggregate_edge_load += routing_fraction * demand_volume;
-                    edge_flow_mappings[e].emplace_back(k, routing_fraction);
+            auto iterator = current_flow_routing[k].find(current_link);
+            if (iterator != current_flow_routing[k].end()) {
+                double routing_fraction = iterator->second;
+                
+                // Utilize the solver's convergence_epsilon for strict topological truncation
+                if (routing_fraction > convergence_epsilon) {
+                    double traffic_volume = std::get<2>(commodity_demands[k]);
+                    // Dimensionality alignment (MHz to Mbps-equivalent demand)
+                    edge_total_load += routing_fraction * traffic_volume;
+                    edge_commodity_mapping[e].emplace_back(k, routing_fraction);
                 }
             }
         }
 
-        total_link_loads[e] = aggregate_edge_load;
-        if (aggregate_edge_load > 1e-12) {
-            active_edges[e] = true; 
+        aggregate_edge_load[e] = edge_total_load;
+        if (edge_total_load > 1e-12) {
+            is_edge_active[e] = true; // Optimization flag for primal/dual loops
         }
     }
 
-    int num_active_edges = 0;
+    // ==========================================
+    // 1. Transform Routing Fractions to \rho Coefficients
+    // ==========================================
+    int count_active_edges = 0;
+    
     for (int e = 0; e < num_edges; ++e) {
-        if (active_edges[e]) {
-            num_active_edges++;
-            for (auto& flow_data : edge_flow_mappings[e]) {
+        if (is_edge_active[e]) {
+            count_active_edges++;
+            for (auto& flow_data : edge_commodity_mapping[e]) {
                 int k = flow_data.first;
                 double routing_fraction = flow_data.second;
-                double demand_volume = std::get<2>(traffic_demands[k]); 
+                double traffic_volume = std::get<2>(commodity_demands[k]);
 
-                flow_data.second = (routing_fraction * demand_volume) / total_link_loads[e];
+                // Compute \rho = (x_e^k * M^k) / D_e
+                // Zero-division risk eliminated by the is_edge_active flag.
+                flow_data.second = (routing_fraction * traffic_volume) / aggregate_edge_load[e];
             }
         }
     }
 
-    // =========================================================
-    // Phase 1: Primal & Dual Variable Initialization
-    // =========================================================
-    double initial_bandwidth_per_active_edge = (num_active_edges > 0) ? (total_bandwidth_mhz / num_active_edges) : 0.0;
+    // ==========================================
+    // 2. Primal & Dual Variable Initialization 
+    // ==========================================
+    double initial_bandwidth_per_edge = (count_active_edges > 0) ? (total_bandwidth_mhz / count_active_edges) : 0.0;
 
     std::vector<double> bandwidth_allocations(num_edges, 0.0);
-    std::vector<double> delay_allocations(num_edges, 0.0); 
+    std::vector<double> time_allocations(num_edges, 0.0);
 
     for (int e = 0; e < num_edges; ++e) {
-        if (active_edges[e]) {
-            bandwidth_allocations[e] = initial_bandwidth_per_active_edge;
-            delay_allocations[e] = 0.5;
+        if (is_edge_active[e]) {
+            int source_node = static_cast<int>(std::get<0>(edge_list[e]));
+            double initial_power_tx = node_max_powers[source_node]; 
+            
+            bandwidth_allocations[e] = initial_bandwidth_per_edge;
+
+            // Compute realistic initial SNR based on max power and uniform bandwidth
+            double baseline_snr = (initial_power_tx * snr_gain_per_mhz[e]) / bandwidth_allocations[e];
+            
+            // Heuristic Time Initialization: D_e / C_e
+            // Prevents massive initial gradients (t_e - D_e / l_e)
+            double estimated_link_capacity = bandwidth_allocations[e] * std::log2(1.0 + baseline_snr); 
+            estimated_link_capacity = std::max(estimated_link_capacity, 1e-6);
+            time_allocations[e] = aggregate_edge_load[e] / estimated_link_capacity;
         }
     }
 
-    double lambda_price = 1e-5;
-    std::vector<double> sigma_prices(num_nodes, 1e-5);
-    std::vector<double> gamma_prices(num_flows, alpha_tradeoff / std::max(1, num_flows));
+    // Shadow Prices Initialization
+    double price_lambda_bandwidth = 1e-5;
+    std::vector<double> price_sigma_power(num_nodes, 1e-5);
+    std::vector<double> price_gamma_delay(num_flows, fairness_alpha / std::max(1, num_flows));
+    
+    constexpr double kMaxShadowPrice = 10000.0;
+    
+    // Diminishing Step Size Anchors
+    double step_anchor_lambda = 0.01;
+    double step_anchor_sigma = 0.01;
+    double step_anchor_gamma = 0.05;
 
-    double step_size_lambda_base = 0.05; 
-    double step_size_sigma_base = 0.05;
-    double step_size_gamma_base = 0.1;   
+    constexpr double kEpsilonDual = 1e-4;
+    constexpr double kEpsilonFeasible = 1e-3;
 
-    const double kDualTolerance = 1e-4; 
-    const double kFeasibilityTolerance = 1e-3; 
+    int max_iterations = 500;
+    int patience_limit = 50;
+    int consecutive_stall_count = 0;
 
-    // Pocket Algorithm Configuration (Dynamic Early Stopping)
-    const int kMaxIterations = 500; 
-    const int kPatienceLimit = 50; 
-    int stall_counter = 0;      
+    double best_observed_metric = 1e12; 
 
-    double best_drift_metric = 1e9; 
-    std::vector<double> best_bandwidth_allocations = bandwidth_allocations;
-    std::vector<double> best_delay_allocations = delay_allocations;
+    // The Doomsday Pocket (Safe state preservation)
+    std::vector<double> pocket_bandwidth = bandwidth_allocations;
+    std::vector<double> pocket_time = time_allocations;
 
-    // =========================================================
-    // Phase 2: Dual Decomposition Macro-Loop
-    // =========================================================
-    for (int iter = 0; iter < kMaxIterations; ++iter) {
-        double current_step_lambda = step_size_lambda_base / (iter + 1.0);
-        double current_step_sigma = step_size_sigma_base / (iter + 1.0);
-        double current_step_gamma = step_size_gamma_base / (iter + 1.0);
+    // ==========================================
+    // 3. Main Primal-Dual Iteration Loop
+    // ==========================================
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        
+        // Strictly Squared Summable, but not Summable (SSBNS) step sizes
+        double current_step_lambda = step_anchor_lambda / (iter + 1.0);
+        double current_step_sigma = step_anchor_sigma / (iter + 1.0);
+        double current_step_gamma = step_anchor_gamma / (iter + 1.0);
 
-        double prev_lambda = lambda_price;
-        std::vector<double> prev_sigma = sigma_prices;
-        std::vector<double> prev_gamma = gamma_prices;
+        // State preservation for convergence drift analysis
+        double previous_lambda = price_lambda_bandwidth;
+        std::vector<double> previous_sigma = price_sigma_power;
+        std::vector<double> previous_gamma = price_gamma_delay;
 
         // --- Step A: Distributed Primal Update ---
         for (int e = 0; e < num_edges; ++e) {
-            if (!active_edges[e]) {
+            
+            // O(1) bypass for topological dead-ends
+            if (!is_edge_active[e]) {
                 bandwidth_allocations[e] = 0.0;
-                delay_allocations[e] = 0.0;
+                time_allocations[e] = 0.0;
                 continue;
             }
 
             int u = static_cast<int>(std::get<0>(edge_list[e]));
 
+            // Aggregate Delay Shadow Price: \Lambda_{ij} = \sum (\gamma_k * \rho_{ij}^k)
             double aggregate_delay_price = 0.0;
-            for (const auto& flow_info : edge_flow_mappings[e]) {
+            for (const auto& flow_info : edge_commodity_mapping[e]) {
                 int k = flow_info.first;
-                double rho = flow_info.second;
-                aggregate_delay_price += gamma_prices[k] * rho;
+                double rho_fraction = flow_info.second;
+                aggregate_delay_price += price_gamma_delay[k] * rho_fraction;
             }
 
+            // CRITICAL: Subproblem coordinate descent. 
+            // Passes snr_gain_per_mhz directly to avert internal extreme division faults.
             solve_link_subproblem(
-                bandwidth_allocations[e], delay_allocations[e],              
-                total_link_loads[e], snr_gain_coefficients[e],       
-                lambda_price, sigma_prices[u], aggregate_delay_price,    
-                max_node_powers[u],                                
-                alpha_tradeoff, tolerance_epsilon                  
+                bandwidth_allocations[e], time_allocations[e],      
+                aggregate_edge_load[e], snr_gain_per_mhz[e],      
+                price_lambda_bandwidth, price_sigma_power[u], aggregate_delay_price,    
+                node_max_powers[u],              // Absolute physical constraint wall
+                fairness_alpha, convergence_epsilon,          
+                total_bandwidth_mhz
             );
 
-            bandwidth_allocations[e] = std::max(bandwidth_allocations[e], tolerance_epsilon);
-            delay_allocations[e] = std::max(delay_allocations[e], tolerance_epsilon);
+            // Safety floor clamping
+            bandwidth_allocations[e] = std::max(bandwidth_allocations[e], convergence_epsilon);
+            time_allocations[e] = std::max(time_allocations[e], convergence_epsilon);
         }
 
-        // --- Step B: Dual Update ---
-        // 1. Update Lambda (System Bandwidth Constraint)
-        double total_allocated_bandwidth = std::accumulate(bandwidth_allocations.begin(), bandwidth_allocations.end(), 0.0);
-        double lambda_gradient = (total_allocated_bandwidth - total_bandwidth_mhz) / total_bandwidth_mhz;
+        // --- Step B: Dual Update (Subgradient Ascent) ---
 
-        lambda_gradient = std::clamp(lambda_gradient, -2.0, 5.0); 
-        lambda_price = std::max(0.0, lambda_price + current_step_lambda * lambda_gradient);
+        // 1. Global Bandwidth Constraint Price (\lambda)
+        double sum_allocated_bandwidth = std::accumulate(bandwidth_allocations.begin(), bandwidth_allocations.end(), 0.0);
+        double grad_lambda = (sum_allocated_bandwidth - total_bandwidth_mhz) / total_bandwidth_mhz;
 
-        // 2. Update Sigma (Nodal Power Constraints)
-        std::vector<double> node_power_sums(num_nodes, 0.0);
+        // Graceful Gradient Clipping via std::clamp
+        grad_lambda = std::clamp(grad_lambda, -2.0, 5.0); 
+        price_lambda_bandwidth = std::max(0.0, price_lambda_bandwidth + current_step_lambda * grad_lambda);
+        price_lambda_bandwidth = std::min(price_lambda_bandwidth, kMaxShadowPrice);
+
+        // 2. Node Power Constraint Prices (\sigma_i)
+        std::vector<double> aggregate_node_power(num_nodes, 0.0);
 
         for (int e = 0; e < num_edges; ++e) {
-            if (!active_edges[e]) continue;
+            if (!is_edge_active[e]) continue;
 
-            double safe_bandwidth = std::max(bandwidth_allocations[e], tolerance_epsilon);
-            double safe_delay = std::max(delay_allocations[e], tolerance_epsilon);
+            double safe_bandwidth = std::max(bandwidth_allocations[e], convergence_epsilon);
+            double safe_time = std::max(time_allocations[e], convergence_epsilon);
 
-            double shannon_exponent = total_link_loads[e] / (safe_bandwidth * safe_delay);
-            double allocated_power = 0.0;
+            double capacity_exponent = aggregate_edge_load[e] / (safe_bandwidth * safe_time);
+            double required_tx_power = 0.0;
             int u = static_cast<int>(std::get<0>(edge_list[e]));
 
-            if (shannon_exponent > 50.0) {
-                allocated_power = max_node_powers[u] * 2.0;
+            // Absolute Physical Wall Defense
+            if (capacity_exponent > 50.0) {
+                // Catastrophic Violation: Power diverges to inf. 
+                // Artificially assign 2x the max power to trigger a massive, immediate 
+                // gradient spike in \sigma_u, forcing the primal step to retreat next iteration.
+                required_tx_power = node_max_powers[u] * 2.0;
             } else {
-                allocated_power = safe_bandwidth * (1.0 / snr_gain_coefficients[e]) * (std::pow(2.0, shannon_exponent) - 1.0);
+                required_tx_power = (std::pow(2.0, capacity_exponent) - 1.0) * safe_bandwidth / snr_gain_per_mhz[e];
             }
 
-            node_power_sums[u] += allocated_power;
+            aggregate_node_power[u] += required_tx_power;
         }
 
+        double max_violation_ratio = -std::numeric_limits<double>::infinity();
+        
         for (int i = 0; i < num_nodes; ++i) {
-            if (max_node_powers[i] > tolerance_epsilon) {
-                double sigma_gradient = (node_power_sums[i] - max_node_powers[i]) / max_node_powers[i];
-                sigma_gradient = std::clamp(sigma_gradient, -2.0, 5.0);
-                sigma_prices[i] = std::max(0.0, sigma_prices[i] + current_step_sigma * sigma_gradient);
+            if (node_max_powers[i] > convergence_epsilon) {
+                double raw_grad_sigma = (aggregate_node_power[i] - node_max_powers[i]) / node_max_powers[i];
+
+                max_violation_ratio = std::max(max_violation_ratio, raw_grad_sigma);
+                
+                double clipped_grad_sigma = std::clamp(raw_grad_sigma, -2.0, 5.0);
+                price_sigma_power[i] = std::max(0.0, price_sigma_power[i] + current_step_sigma * clipped_grad_sigma);
+                price_sigma_power[i] = std::min(price_sigma_power[i], kMaxShadowPrice);
             }
         }
 
-        // 3. Update Gamma (Delay Weights via Simplex Projection)
-        std::vector<double> gamma_gradients(num_flows, 0.0);
+        // 3. User Fairness Constraint Prices (\gamma_k) via Simplex Projection
+        std::vector<double> gamma_gradient(num_flows, 0.0);
 
         for (int e = 0; e < num_edges; ++e) {
-            if (!active_edges[e]) continue;
+            if (!is_edge_active[e]) continue;
 
-            for (const auto& flow_info : edge_flow_mappings[e]) {
+            for (const auto& flow_info : edge_commodity_mapping[e]) {
                 int k = flow_info.first;
-                double rho = flow_info.second;
-                gamma_gradients[k] += rho * delay_allocations[e];
+                double rho_fraction = flow_info.second;
+                
+                // time_allocations[e] is strictly positive due to prior clamping
+                gamma_gradient[k] += rho_fraction * time_allocations[e];
             }
         }
 
-        std::vector<double> next_gamma_prices = gamma_prices;
+        std::vector<double> next_gamma_state = price_gamma_delay;
+        
         for (int k = 0; k < num_flows; ++k) {
-            double safe_gamma_gradient = std::clamp(gamma_gradients[k], 0.0, 10.0);
-            next_gamma_prices[k] += current_step_gamma * safe_gamma_gradient;
+            // Gentle clipping to prevent extreme outlier delays (e.g., 500s penalty) 
+            // from annihilating the simplex geometry in a single step.
+            double safe_gamma_grad = std::clamp(gamma_gradient[k], 0.0, 10.0);
+            next_gamma_state[k] += current_step_gamma * safe_gamma_grad;
         }
 
-        gamma_prices = project_simplex(next_gamma_prices, alpha_tradeoff);
+        // Project onto the \alpha simplex: \sum \gamma_k = \alpha
+        price_gamma_delay = project_simplex(next_gamma_state, fairness_alpha);
 
-        // --- Step C: Convergence Criteria & Dynamic Stopping ---
-        double relative_bandwidth_violation = std::max(0.0, total_allocated_bandwidth - total_bandwidth_mhz) / total_bandwidth_mhz;
-
-        double max_relative_power_violation = 0.0;
+        // ==========================================
+        // 4. Convergence Diagnostics & The Doomsday Pocket
+        // ==========================================
+        double bandwidth_violation_ratio = std::max(0.0, sum_allocated_bandwidth - total_bandwidth_mhz) / total_bandwidth_mhz;
+        double maximum_power_violation = 0.0;
+        
         for (int i = 0; i < num_nodes; ++i) {
-            if (max_node_powers[i] > tolerance_epsilon) {
-                double power_violation = std::max(0.0, node_power_sums[i] - max_node_powers[i]) / max_node_powers[i];
-                max_relative_power_violation = std::max(max_relative_power_violation, power_violation);
+            if (node_max_powers[i] > convergence_epsilon) {
+                double node_p_viol = std::max(0.0, aggregate_node_power[i] - node_max_powers[i]) / node_max_powers[i];
+                maximum_power_violation = std::max(maximum_power_violation, node_p_viol);
             }
         }
 
-        bool is_state_feasible = (relative_bandwidth_violation < kFeasibilityTolerance) && (max_relative_power_violation < kFeasibilityTolerance);
+        bool state_is_feasible = (bandwidth_violation_ratio < kEpsilonFeasible) && (maximum_power_violation < kEpsilonFeasible);
+        double total_system_violation = bandwidth_violation_ratio + maximum_power_violation;
 
+        // L2 Norm Drift Calculus (Standard NUM Convergence Metric)
         auto calculate_l2_drift = [](const std::vector<double>& current, const std::vector<double>& previous) {
-            double numerator = 0.0, denominator = 0.0;
-            for (size_t i = 0; i < current.size(); ++i) {
-                double difference = current[i] - previous[i];
-                numerator += difference * difference;
-                denominator += previous[i] * previous[i];
+            double numerator_sq = 0.0, denominator_sq = 0.0;
+            for (std::size_t i = 0; i < current.size(); ++i) {
+                double diff = current[i] - previous[i];
+                numerator_sq += diff * diff;
+                denominator_sq += previous[i] * previous[i];
             }
-            return std::sqrt(numerator) / (std::sqrt(denominator) + 1e-9); 
+            return std::sqrt(numerator_sq) / (std::sqrt(denominator_sq) + 1e-9); 
         };
 
-        double maximum_dual_drift = 0.0;
-        double drift_lambda = std::abs(lambda_price - prev_lambda) / (prev_lambda + 1e-9);
-        maximum_dual_drift = std::max(maximum_dual_drift, drift_lambda);
+        double dual_state_drift = 0.0;
 
-        double drift_sigma = calculate_l2_drift(sigma_prices, prev_sigma);
-        maximum_dual_drift = std::max(maximum_dual_drift, drift_sigma);
+        double lambda_state_drift = std::abs(price_lambda_bandwidth - previous_lambda) / (previous_lambda + 1e-9);
+        dual_state_drift = std::max(dual_state_drift, lambda_state_drift);
 
-        double drift_gamma = calculate_l2_drift(gamma_prices, prev_gamma);
-        maximum_dual_drift = std::max(maximum_dual_drift, drift_gamma);
+        double sigma_state_drift = calculate_l2_drift(price_sigma_power, previous_sigma);
+        dual_state_drift = std::max(dual_state_drift, sigma_state_drift);
 
-        if (is_state_feasible && maximum_dual_drift < kDualTolerance) {
-            best_bandwidth_allocations = bandwidth_allocations;
-            best_delay_allocations = delay_allocations;
-            break; 
+        double gamma_state_drift = calculate_l2_drift(price_gamma_delay, previous_gamma);
+        dual_state_drift = std::max(dual_state_drift, gamma_state_drift);
+
+        double aggregate_max_violation = std::max(grad_lambda, max_violation_ratio);
+
+        // ==========================================
+        // 5. Dynamic Early Stopping & The Doomsday Pocket
+        // ==========================================
+        
+        // Define minimum threshold to qualify as a substantial algorithmic descent
+        constexpr double kMinSubstantialImprovement = 1e-6;
+
+        if (state_is_feasible && dual_state_drift < kEpsilonDual) {
+            pocket_bandwidth = bandwidth_allocations; 
+            pocket_time = time_allocations;
+            break; // Perfect Convergence achieved
         }
 
-        if (is_state_feasible && maximum_dual_drift < best_drift_metric) { 
-            best_drift_metric = maximum_dual_drift;
-            best_bandwidth_allocations = bandwidth_allocations;
-            best_delay_allocations = delay_allocations;
-            stall_counter = 0;
-        } else if (is_state_feasible) {
-            stall_counter++;
+        if (state_is_feasible) {
+            // Strictly require substantive drift reduction to reset patience
+            if (dual_state_drift < best_observed_metric - kMinSubstantialImprovement) {
+                best_observed_metric = dual_state_drift;
+                pocket_bandwidth = bandwidth_allocations;
+                pocket_time = time_allocations;
+                consecutive_stall_count = 0; 
+            } else {
+                // Feasible, but descent is marginal (likely due to step decay). Consume patience.
+                consecutive_stall_count++;
+            }
+        } else {
+            // Unfeasible state progression also consumes patience to prevent infinite loops.
+            consecutive_stall_count++;
+
+            // The Doomsday Pocket: Salvaging the "Least Worst" violation state 
+            static double minimum_historical_violation = 1e9;
+            if (total_system_violation < minimum_historical_violation) {
+                minimum_historical_violation = total_system_violation;
+                
+                // Only update the pocket if we have never seen a feasible state
+                if (best_observed_metric > 1e11) { 
+                    pocket_bandwidth = bandwidth_allocations;
+                    pocket_time = time_allocations;
+                    
+                    // Minor patience reward for discovering a strictly less-violating boundary
+                    consecutive_stall_count = std::max(0, consecutive_stall_count - 5);
+                }
+            }
         }
 
-        if (stall_counter >= kPatienceLimit) {
-            break; 
+        if (consecutive_stall_count >= patience_limit) {
+            std::cout << "[Dual Decomposition] Early Stop triggered. Patience limit (" << patience_limit << ") exhausted.\n";
+            break;
         }
-    } 
+    } // ---------- End Main Dual Loop ----------
 
-    // =========================================================
-    // Phase 3: Extraction & Result Packaging
-    // =========================================================
-    bandwidth_allocations = best_bandwidth_allocations;
-    delay_allocations = best_delay_allocations;
+    // ==========================================
+    // Post-Processing: Restore Optimal State & Enforce Physical Laws
+    // ==========================================
+    
+    // Retrieve the pinnacle state from the preservation pocket
+    bandwidth_allocations = pocket_bandwidth;
+    time_allocations = pocket_time;
 
-    OptimizationResult result_payload;
-    result_payload.l_opt = bandwidth_allocations;
-    result_payload.t_opt = delay_allocations;
-    result_payload.p_opt.resize(num_edges, 0.0);
-    result_payload.r_opt.resize(num_edges, 0.0);
+    OptimizationResult final_result;
+    final_result.optimal_bandwidths = bandwidth_allocations;
+    final_result.optimal_transmission_times = time_allocations;
+    final_result.optimal_powers.resize(num_edges, 0.0);
+    final_result.optimal_rates.resize(num_edges, 0.0);
 
-    double system_total_energy = 0.0;
+    double computed_total_energy = 0.0;
 
     for (int e = 0; e < num_edges; ++e) {
-        if (active_edges[e]) {
-            int u = static_cast<int>(std::get<0>(edge_list[e]));
-            double safe_bandwidth = std::max(bandwidth_allocations[e], tolerance_epsilon);
-            double safe_delay = std::max(delay_allocations[e], tolerance_epsilon);
+        if (is_edge_active[e]) {
+            int source_node = static_cast<int>(std::get<0>(edge_list[e]));
+            
+            double safe_bandwidth = std::max(bandwidth_allocations[e], convergence_epsilon);
+            double safe_time = std::max(time_allocations[e], convergence_epsilon);
 
-            double shannon_exponent = total_link_loads[e] / (safe_bandwidth * safe_delay);
-            double computed_power = 0.0;
+            double capacity_exponent = aggregate_edge_load[e] / (safe_bandwidth * safe_time);
+            double physical_power = 0.0;
 
-            if (shannon_exponent > 50.0) {
-                computed_power = max_node_powers[u]; 
+            if (capacity_exponent > 50.0) {
+                // Internal accounting penalty for severe overload
+                physical_power = node_max_powers[source_node] * 2.0; 
             } else {
-                computed_power = safe_bandwidth * (1.0 / snr_gain_coefficients[e]) * (std::pow(2.0, shannon_exponent) - 1.0);
+                physical_power = (std::pow(2.0, capacity_exponent) - 1.0) * safe_bandwidth / snr_gain_per_mhz[e];
             }
 
-            result_payload.p_opt[e] = std::clamp(computed_power, 0.0, max_node_powers[u]);
-            result_payload.r_opt[e] = total_link_loads[e] / safe_delay;
+            // --- Physical Law Re-assertion ---
+            // 1. Strict truncation of transmit power
+            final_result.optimal_powers[e] = std::clamp(physical_power, 0.0, node_max_powers[source_node]);
 
-            system_total_energy += result_payload.p_opt[e] * safe_delay;
+            // 2. Capacity must be re-calculated based on the truncated power via Shannon's formula.
+            // DO NOT use the aspirational D/t ratio, as it violates the newly clamped physical boundary.
+            double truncated_snr = (final_result.optimal_powers[e] * snr_gain_per_mhz[e]) / safe_bandwidth;
+            double actual_shannon_capacity = safe_bandwidth * std::log2(1.0 + truncated_snr);
+            final_result.optimal_rates[e] = std::max(actual_shannon_capacity, convergence_epsilon);
+
+            computed_total_energy += final_result.optimal_powers[e] * safe_time;
         }
     }
-    result_payload.total_energy = system_total_energy;
+    
+    final_result.total_system_energy = computed_total_energy;
 
-    // =========================================================
-    // Phase 4: Dual-Track Delay Assessment (Expected & Maximum)
-    // =========================================================
-    double system_max_delay = 0.0;
-    double system_max_sum_delay = 0.0;
-    const double kMaxDelayPenalty = 1e8;
+    // ===================================================================
+    // Dual-Track Delay Audit Engine:
+    // Track A: Expected Sum Delay (Linear Accumulation)
+    // Track B: Physical Worst-Case Delay (DFS Memoization DAG Search)
+    // ===================================================================
+    
+    double computed_max_end_to_end_delay = 0.0;
+    double computed_max_sum_delay = 0.0;
+    constexpr double kMaxDelayPenalty = 1e8;
 
-    std::vector<std::vector<std::pair<int, double>>> delay_adjacency_list(num_nodes);
-    std::vector<double> longest_path_memo(num_nodes, -1.0);
-    std::vector<bool> recursion_stack(num_nodes, false);
+    // Pre-allocate DFS memory structures to prevent heap fragmentation
+    std::vector<std::vector<std::pair<int, double>>> subgraph_adjacency(num_nodes);
+    std::vector<double> delay_memoization(num_nodes, -1.0);
+    std::vector<bool> recursion_visited_stack(num_nodes, false);
 
-    std::vector<double> flow_maximum_path_delays(num_flows, kMaxDelayPenalty);
+    std::vector<double> commodity_max_delays(num_flows, kMaxDelayPenalty);
 
     for (int k = 0; k < num_flows; ++k) {
-        int src_node = static_cast<int>(std::get<0>(traffic_demands[k]));
-        int des_node = static_cast<int>(std::get<1>(traffic_demands[k]));
-        double demand_volume = std::get<2>(traffic_demands[k]);
+        int source_node = static_cast<int>(std::get<0>(commodity_demands[k]));
+        int target_node = static_cast<int>(std::get<1>(commodity_demands[k]));
+        double traffic_volume = std::get<2>(commodity_demands[k]);
 
-        // Track A: Expected Delay Accrual
-        double expected_delay_k = 0.0;
-        bool has_valid_flow = false;
+        // Track A Setup: Mathematical Expectation Accumulator
+        double expected_commodity_delay = 0.0;
+        bool possesses_valid_flow = false;
 
-        for (auto& edges : delay_adjacency_list) edges.clear();
+        for (auto& adjacency_list : subgraph_adjacency) {
+            adjacency_list.clear();
+        }
 
         for (int e = 0; e < num_edges; ++e) {
-            if (active_edges[e]) {
+            if (is_edge_active[e]) {
                 int u = static_cast<int>(std::get<0>(edge_list[e]));
                 int v = static_cast<int>(std::get<1>(edge_list[e]));
                 Link current_link = { u, v };
 
-                auto it = flow_fractions[k].find(current_link);
-                if (it != flow_fractions[k].end() && it->second > tolerance_epsilon) {
-                    double routing_fraction = it->second;
+                auto iterator = current_flow_routing[k].find(current_link);
+                
+                // Filter microscopic numerical dust flows using strict epsilon threshold
+                if (iterator != current_flow_routing[k].end() && iterator->second > convergence_epsilon) {
+                    double routing_fraction = iterator->second;
 
-                    double rho = (routing_fraction * demand_volume) / total_link_loads[e];
-                    double physical_edge_delay = rho * delay_allocations[e];
+                    // Revert to original Lagrangian definition of edge traversal time t_ij
+                    double share_ratio = (routing_fraction * traffic_volume) / aggregate_edge_load[e];
+                    double edge_traversal_time = share_ratio * time_allocations[e];
 
-                    expected_delay_k += physical_edge_delay;
-                    delay_adjacency_list[u].push_back({ v, physical_edge_delay });
+                    // Track A accumulation
+                    expected_commodity_delay += edge_traversal_time;
 
-                    has_valid_flow = true;
+                    // Track B graph construction (strictly utilizing t_ij as edge weights)
+                    subgraph_adjacency[u].push_back({ v, edge_traversal_time });
+
+                    possesses_valid_flow = true;
                 }
             }
         }
 
-        if (has_valid_flow) {
-            system_max_sum_delay = std::max(system_max_sum_delay, expected_delay_k);
-        } else {
-            system_max_sum_delay = std::max(system_max_sum_delay, kMaxDelayPenalty);
-        }
+        // Track B Execution: Cycle-Immune DFS for Topographical Bottlenecks
+        if (possesses_valid_flow) {
+            std::fill(delay_memoization.begin(), delay_memoization.end(), -1.0);
+            std::fill(recursion_visited_stack.begin(), recursion_visited_stack.end(), false);
 
-        // Track B: Memoized DFS Maximum Path Delay 
-        if (has_valid_flow) {
-            std::fill(longest_path_memo.begin(), longest_path_memo.end(), -1.0);
-            std::fill(recursion_stack.begin(), recursion_stack.end(), false);
+            std::function<double(int)> search_longest_path = [&](int current_vertex) -> double {
+                if (current_vertex == target_node) return 0.0;
+                if (recursion_visited_stack[current_vertex]) return -kMaxDelayPenalty;
+                if (delay_memoization[current_vertex] >= -0.5) return delay_memoization[current_vertex];
 
-            std::function<double(int)> dfs_longest_path = [&](int current_node) -> double {
-                if (current_node == des_node) return 0.0;
-                if (recursion_stack[current_node]) return -kMaxDelayPenalty;
-                if (longest_path_memo[current_node] >= -0.5) return longest_path_memo[current_node];
-
-                recursion_stack[current_node] = true;
+                recursion_visited_stack[current_vertex] = true;
                 double max_downstream_delay = -kMaxDelayPenalty;
 
-                for (const auto& edge : delay_adjacency_list[current_node]) {
-                    int next_node = edge.first;
-                    double edge_delay = edge.second; 
-                    double downstream_delay = dfs_longest_path(next_node);
+                for (const auto& edge : subgraph_adjacency[current_vertex]) {
+                    int next_vertex = edge.first;
+                    double link_delay = edge.second; 
+                    double downstream_delay = search_longest_path(next_vertex);
 
                     if (downstream_delay > -kMaxDelayPenalty / 2.0) {
-                        max_downstream_delay = std::max(max_downstream_delay, edge_delay + downstream_delay);
+                        max_downstream_delay = std::max(max_downstream_delay, link_delay + downstream_delay);
                     }
                 }
 
-                recursion_stack[current_node] = false;
-                return longest_path_memo[current_node] = max_downstream_delay;
+                recursion_visited_stack[current_vertex] = false;
+                return delay_memoization[current_vertex] = max_downstream_delay;
             };
 
-            double current_flow_max_path = dfs_longest_path(src_node);
+            double physical_max_path_delay = search_longest_path(source_node);
 
-            if (current_flow_max_path > -0.5 && current_flow_max_path < kMaxDelayPenalty / 2.0) {
-                system_max_delay = std::max(system_max_delay, current_flow_max_path);
-                flow_maximum_path_delays[k] = current_flow_max_path;
+            // =========================================================
+            // 🚨 Ultimate Verdict: Strict Subsumption Logic
+            // Track A (Math) is only validated IF Track B (Physics) confirms connectivity.
+            // =========================================================
+            if (physical_max_path_delay > -0.5 && physical_max_path_delay < kMaxDelayPenalty / 2.0) {
+                // VERDICT: Connectivity Confirmed
+
+                // 1. Commit Track B metrics
+                computed_max_end_to_end_delay = std::max(computed_max_end_to_end_delay, physical_max_path_delay);
+                commodity_max_delays[k] = physical_max_path_delay;
+
+                // 2. Commit Track A metrics (now mathematically legal)
+                computed_max_sum_delay = std::max(computed_max_sum_delay, expected_commodity_delay);
             } else {
-                system_max_delay = std::max(system_max_delay, kMaxDelayPenalty);
-                flow_maximum_path_delays[k] = kMaxDelayPenalty;
+                // VERDICT: Pathological Disconnection (Fractured sub-paths)
+
+                // 1. Track B Penalty
+                computed_max_end_to_end_delay = std::max(computed_max_end_to_end_delay, kMaxDelayPenalty);
+                commodity_max_delays[k] = kMaxDelayPenalty;
+
+                // 2. Track A Contagion Penalty (Fractured flows cannot accrue valid math expectations)
+                computed_max_sum_delay = std::max(computed_max_sum_delay, kMaxDelayPenalty);
             }
         } else {
-            system_max_delay = std::max(system_max_delay, kMaxDelayPenalty);
+            // VERDICT: Total Flow Starvation (Zero connectivity)
+            computed_max_end_to_end_delay = std::max(computed_max_end_to_end_delay, kMaxDelayPenalty);
+            computed_max_sum_delay = std::max(computed_max_sum_delay, kMaxDelayPenalty); 
+            commodity_max_delays[k] = kMaxDelayPenalty;
         }
     }
+    
+    // Dispatch Results
+    final_result.max_end_to_end_delay = computed_max_end_to_end_delay;
+    final_result.max_expected_sum_delay = computed_max_sum_delay;
+    final_result.commodity_max_delays = std::move(commodity_max_delays);
 
-    result_payload.max_delay = system_max_delay;
-    result_payload.max_sum_delay = system_max_sum_delay;
-    result_payload.flow_max_delays = std::move(flow_maximum_path_delays);
-
-    return result_payload;
+    return final_result;
 }
