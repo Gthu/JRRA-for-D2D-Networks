@@ -1,116 +1,168 @@
-#pragma once
+#ifndef OPTIMIZATION_SOLVERS_H_
+#define OPTIMIZATION_SOLVERS_H_
 
-#include <vector>
-#include <tuple>
 #include <map>
 #include <string>
+#include <tuple>
+#include <vector>
 
-#include "graph.h" 
+#include "graph.h"
+
+// =========================================================
+// Optimization Results Data Structure
+// =========================================================
 
 /**
- * @brief Structure to store the converged physical layer resource allocation and routing metrics.
- * 
- * @note This struct acts as the standard payload returned by all optimization sub-solvers 
- * (Dual Decomposition, Greedy, SCA, and Static Baseline) to the main macro-loop.
+ * @brief Encapsulates the network state and performance metrics post-optimization.
  */
 struct OptimizationResult {
-    // Physical Resource Allocations
-    std::vector<double> l_opt;  ///< Optimized bandwidth allocation per link (MHz)
-    std::vector<double> p_opt;  ///< Optimized power allocation per link (Watts)
-    std::vector<double> r_opt;  ///< Optimized physical transmission rate per link (Mbps)
-    std::vector<double> t_opt;  ///< Optimized transmission delay per link (s)
+    std::vector<double> optimal_bandwidths;       
+    std::vector<double> optimal_powers;           
+    std::vector<double> optimal_rates;            
+    std::vector<double> optimal_transmission_times; 
 
-    // System-Level Performance Metrics
-    double max_delay;           ///< Maximum end-to-end topological delay across all flows (s)
-    double total_energy;        ///< Total energy consumption of the system (Joules)
-    double max_sum_delay;       ///< Maximum expected aggregated delay across all flows (s)
+    // System-level Performance Metrics
+    double max_end_to_end_delay;                  
+    double total_system_energy;                   
     
-    std::vector<double> flow_max_delays;           ///< Specific maximum delay mapped to each individual traffic flow
-    std::vector<std::map<Link, double>> final_x_flow; ///< Final converged routing fractions (Used primarily by Joint Solvers)
+    std::vector<double> commodity_max_delays;     
+    double max_expected_sum_delay;                
+    
+    std::vector<std::map<Link, double>> final_flow_routing; 
 
-    /**
-     * @brief Default constructor initializing performance metrics to zero.
-     */
-    OptimizationResult() : max_delay(0.0), total_energy(0.0), max_sum_delay(0.0) {}
+    OptimizationResult() 
+        : max_end_to_end_delay(0.0), total_system_energy(0.0), max_expected_sum_delay(0.0) {}
 
-    /**
-     * @brief Parameterized constructor for direct state assignment.
-     */
-    OptimizationResult(std::vector<double> l, std::vector<double> p, std::vector<double> r, std::vector<double> t)
-        : l_opt(std::move(l)), p_opt(std::move(p)), r_opt(std::move(r)), t_opt(std::move(t)), 
-          max_delay(0.0), total_energy(0.0), max_sum_delay(0.0) {}
+    OptimizationResult(std::vector<double> bandwidths, 
+                       std::vector<double> powers, 
+                       std::vector<double> rates, 
+                       std::vector<double> times)
+        : optimal_bandwidths(std::move(bandwidths)), 
+          optimal_powers(std::move(powers)), 
+          optimal_rates(std::move(rates)), 
+          optimal_transmission_times(std::move(times)), 
+          max_end_to_end_delay(0.0), 
+          total_system_energy(0.0),
+          max_expected_sum_delay(0.0) {}
 };
 
-// ==================================================================================
-// Sub-Solver Interface Definitions
-// ==================================================================================
+// =========================================================
+// Optimization Solvers API
+// =========================================================
 
 /**
- * @brief Executes the Lagrangian Dual Decomposition solver for joint resource allocation.
- * 
- * @param edge_list Tuple list defining the physical topology (u, v, distance).
- * @param num_nodes Total number of nodes in the network.
- * @param max_node_powers Maximum power budget constraint for each node.
- * @param total_bandwidth_mhz Total available system spectrum bandwidth in MHz.
- * @param traffic_demands Tuple list defining commodity traffic flows (src, dst, volume).
- * @param flow_fractions Routing fractions obtained from the preceding routing phase.
- * @param noise_power_dbm_mhz Noise power spectral density (dBm/MHz).
- * @param alpha_tradeoff Trade-off parameter balancing delay vs. energy consumption.
- * @param tolerance_epsilon Small constant for numerical stability and subgradient truncation.
- * @return OptimizationResult Structure containing the converged resources and objective metrics.
+ * @brief Executes a distributed resource allocation solver utilizing Lagrangian Dual Decomposition.
+ * * @param edge_list Master list of network edges (source, destination, delay).
+ * @param num_nodes Total number of vertices in the network graph.
+ * @param node_max_powers Vector specifying the maximum power constraint per node.
+ * @param total_bandwidth_mhz The total available spectrum bandwidth in MHz.
+ * @param commodity_demands Traffic demand matrix specifying source, destination, and volume.
+ * @param current_flow_routing The pre-computed flow routing matrix on active links.
+ * @param noise_density_dbm_per_mhz Additive White Gaussian Noise (AWGN) power spectral density.
+ * @param fairness_alpha The scaling parameter for the $\alpha$-fairness utility function.
+ * @param convergence_epsilon Tolerance threshold for subgradient descent termination.
+ * * @return OptimizationResult containing optimal bandwidth/power matrices and system metrics.
+ * * @note The algorithm solves the network utility maximization (NUM) problem by relaxing 
+ * coupling constraints via Lagrangian multipliers. It iteratively updates primal variables 
+ * (power, bandwidth) and dual variables (prices) using subgradient descent. 
+ * Convergence rate is roughly $\mathcal{O}(1/\sqrt{k})$ where $k$ is the iteration count.
  */
 OptimizationResult run_dual_decomposition_solver(
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list,
     int num_nodes,
-    const std::vector<double>& max_node_powers,
+    const std::vector<double>& node_max_powers,
     double total_bandwidth_mhz,
-    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
-    const std::vector<std::map<Link, double>>& flow_fractions,
-    double noise_power_dbm_mhz,
-    double alpha_tradeoff,
-    double tolerance_epsilon
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& current_flow_routing,
+    double noise_density_dbm_per_mhz,
+    double fairness_alpha,
+    double convergence_epsilon
 );
 
 /**
- * @brief Executes the baseline Equal Resource Allocation (ERA) strategy.
- * 
- * @param edge_list Tuple list defining the physical topology.
- * @param traffic_demands Tuple list defining commodity traffic flows.
- * @param flow_fractions Routing distributions evaluated for static allocation.
- * @param total_bandwidth_spectrum System-wide spectrum budget.
- * @param max_power_per_node Uniform maximum available transmission power per node.
- * @param noise_power_dbm_per_mhz Noise power spectral density.
- * @return OptimizationResult Structure containing uniformly distributed resources.
+ * @brief Executes a Game-Theoretic Greedy allocation strategy (Resource Allocation ONLY).
+ * * @param edge_list Master list of network edges.
+ * @param num_nodes Total number of vertices in the network graph.
+ * @param node_max_powers Vector specifying the maximum power constraint per node.
+ * @param total_bandwidth_mhz The total available spectrum bandwidth in MHz.
+ * @param commodity_demands Traffic demand matrix.
+ * @param current_flow_routing The active routing baseline to optimize resources over.
+ * @param noise_density_dbm_per_mhz AWGN power spectral density.
+ * * @return OptimizationResult containing the resource allocation mapping.
+ * * @note This solver models the resource contention as a non-cooperative game, allocating 
+ * marginal resources sequentially to links that yield the steepest gradient in system utility. 
+ * It approximates a Nash Equilibrium under localized information constraints.
+ */
+OptimizationResult run_game_greedy_allocation(
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list,
+    int num_nodes,
+    const std::vector<double>& node_max_powers,
+    double total_bandwidth_mhz,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& current_flow_routing,
+    double noise_density_dbm_per_mhz
+);
+
+/**
+ * @brief Executes a static, uniform equal-allocation baseline for benchmarking.
+ * * @param edge_list Master list of network edges (utilizing generic weight_t).
+ * @param commodity_demands Traffic demand matrix.
+ * @param current_flow_routing The pre-computed flow routing matrix.
+ * @param total_bandwidth_mhz The total available spectrum bandwidth in MHz.
+ * @param max_power_per_node A uniform maximum power constraint applied to all nodes.
+ * @param noise_density_dbm_per_mhz AWGN power spectral density.
+ * * @return OptimizationResult representing the uniform heuristic allocation.
+ * * @note Time complexity is $\mathcal{O}(|E|)$ where $|E|$ is the number of active edges. 
+ * Operates purely as a lower-bound performance baseline without iterative optimization.
  */
 OptimizationResult run_static_equal_allocation(
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list, 
-    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,      
-    const std::vector<std::map<Link, double>>& flow_fractions,
-    double total_bandwidth_spectrum,
-    double max_power_per_node,   
-    double noise_power_dbm_per_mhz
+    const std::vector<std::tuple<std::size_t, std::size_t, weight_t>>& edge_list,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& current_flow_routing,
+    double total_bandwidth_mhz,
+    double max_power_per_node,
+    double noise_density_dbm_per_mhz
 );
 
 /**
- * @brief Executes the Game Theory based Greedy baseline for joint routing and resource allocation.
+ * @brief Executes the combined Game-Theoretic Greedy baseline (Routing + Resource Allocation).
+ * * @param edge_list Master list of network edges.
+ * @param num_nodes Total number of vertices in the network graph.
+ * @param node_max_powers Vector specifying the maximum power constraint per node.
+ * @param total_bandwidth_mhz The total available spectrum bandwidth in MHz.
+ * @param commodity_demands Traffic demand matrix.
+ * @param noise_density_dbm_per_mhz AWGN power spectral density.
+ * * @return OptimizationResult containing both computed routing paths and resource allocations.
  */
 OptimizationResult run_game_greedy_baseline(
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list,
     int num_nodes,
-    const std::vector<double>& max_node_powers,
+    const std::vector<double>& node_max_powers,
     double total_bandwidth_mhz,
-    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
-    double noise_power_dbm_mhz
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    double noise_density_dbm_per_mhz
 );
 
 /**
- * @brief Executes the Successive Convex Approximation (SCA) baseline algorithm.
+ * @brief Executes the Successive Convex Approximation (SCA) solver baseline.
+ * * @param edge_list Master list of network edges.
+ * @param num_nodes Total number of vertices in the network graph.
+ * @param node_max_powers Vector specifying the maximum power constraint per node.
+ * @param total_bandwidth_mhz The total available spectrum bandwidth in MHz.
+ * @param commodity_demands Traffic demand matrix.
+ * @param noise_density_dbm_per_mhz AWGN power spectral density.
+ * * @return OptimizationResult derived from the SCA algorithm.
+ * * @note Handles non-convex Shannon capacity constraints $\log_2(1 + \text{SINR})$ by applying 
+ * a first-order Taylor expansion around a local operating point. Iteratively solves the 
+ * resulting convexified subproblems until KKT conditions are met.
  */
 OptimizationResult run_sca_baseline(
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list,
     int num_nodes,
-    const std::vector<double>& max_node_powers,
+    const std::vector<double>& node_max_powers,
     double total_bandwidth_mhz,
-    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
-    double noise_power_dbm_mhz
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    double noise_density_dbm_per_mhz
 );
+
+#endif  // OPTIMIZATION_SOLVERS_H_
