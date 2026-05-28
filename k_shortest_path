@@ -1,0 +1,135 @@
+#include <algorithm>
+#include <cstddef>
+#include <iostream>
+#include <set>
+#include <unordered_set>
+#include <vector>
+
+#include "graph.h"
+
+// =========================================================
+// Anonymous Namespace: Internal Helper Functions
+// =========================================================
+namespace {
+    /**
+     * @brief O(N) validation to detect cycles within a dynamically constructed path.
+     * @param path_nodes The sequence of nodes representing the proposed route.
+     * @return true if a cycle is detected, false otherwise.
+     * @note Placed in an anonymous namespace to prevent Objective Definition Rule (ODR) violations 
+     * at link-time. Utilizes the boolean return of std::unordered_set::insert for optimal efficiency.
+     */
+    inline bool has_cycle(const std::vector<std::size_t>& path_nodes) {
+        std::unordered_set<std::size_t> visited_nodes;
+        for (const std::size_t& node : path_nodes) {
+            // insert().second is false if the element already existed (i.e., a cycle is hit)
+            if (!visited_nodes.insert(node).second) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+// =========================================================
+// K-Shortest Paths (Yen's Algorithm Variant)
+// =========================================================
+
+/**
+ * @brief Computes a set of K-Shortest Paths between a source and destination.
+ * * @param max_search_iterations The maximum depth of deviation iterations to perform.
+ * @param initial_shortest_path The absolute shortest path serving as the initial baseline.
+ * @param max_paths_to_find The maximum number of valid multipath routes to discover.
+ * @param topology_data The structural data of the graph (unused in logic but preserved for API alignment).
+ * @param graph The network topology.
+ * @param source_node The root node of the routing requests.
+ * @return std::vector<GraphPath> A collection of distinct, loop-free paths.
+ * * @note Implements a deviation-path search algorithm based on Yen's framework. It iteratively 
+ * detaches from historical paths at a 'spur node', blacklists previous root nodes to strictly 
+ * prevent cycles, and invokes the oracle (Dijkstra) to discover alternative routing topologies.
+ */
+std::vector<GraphPath> k_shortest_paths(
+    std::size_t max_search_iterations,
+    const GraphPath& initial_shortest_path,
+    std::size_t max_paths_to_find,
+    const Col_gen& topology_data,
+    const Graph& graph,
+    std::size_t source_node
+) {
+    std::vector<GraphPath> final_k_paths;
+    if (initial_shortest_path.empty()) {
+        return final_k_paths;
+    }
+
+    std::set<GraphPath> discovered_paths_set;
+    std::vector<GraphPath> candidate_paths;
+
+    // Bootstrap the exploration with the optimal baseline
+    final_k_paths.push_back(initial_shortest_path);
+    discovered_paths_set.insert(initial_shortest_path);
+    candidate_paths.push_back(initial_shortest_path);
+
+    std::size_t destination_node = initial_shortest_path.back();
+
+    for (std::size_t i = 0; i < max_search_iterations; ++i) {
+        std::vector<GraphPath> new_candidate_paths;
+
+        for (const auto& current_path : candidate_paths) {
+            if (current_path.empty()) continue;
+
+            // Iterate through every node on the path to act as a deviation anchor (spur node)
+            for (std::size_t j = 0; j < current_path.size() - 1; ++j) {
+                std::size_t spur_node = current_path[j];
+                std::size_t next_node = current_path[j + 1];
+
+                // [Blacklist Construction]
+                // Isolate the root path up to the spur node. These historical nodes are blocked 
+                // from the sub-problem to forcefully prevent routing loops.
+                std::vector<std::size_t> root_path_nodes(current_path.begin(), current_path.begin() + j);
+
+                // Oracle Call: Constrained Shortest Path
+                auto [spur_path, path_length] = dijkstra(
+                    graph, spur_node, destination_node, spur_node, next_node, root_path_nodes
+                );
+
+                if (spur_path.empty()) continue;
+
+                // Splice the root historical path with the newly discovered spur path
+                GraphPath total_path;
+                total_path.reserve(root_path_nodes.size() + spur_path.size());
+                total_path.insert(total_path.end(), root_path_nodes.begin(), root_path_nodes.end());
+                total_path.insert(total_path.end(), spur_path.begin(), spur_path.end());
+
+                // Validation Defenses
+                if (has_cycle(total_path)) {
+                    continue; 
+                }
+
+                if (discovered_paths_set.count(total_path)) {
+                    continue;
+                }
+
+                // Append newly discovered legitimate path
+                final_k_paths.push_back(total_path);
+                discovered_paths_set.insert(total_path);
+                new_candidate_paths.push_back(total_path);
+
+                // Early exit: Safely replacing the legacy 'goto EndSearch'
+                if (final_k_paths.size() >= max_paths_to_find) {
+                    return final_k_paths;
+                }
+            }
+        }
+
+        if (new_candidate_paths.empty()) {
+            break; // Exhausted all branch potentials for this iteration layer
+        }
+
+        candidate_paths.insert(candidate_paths.end(), new_candidate_paths.begin(), new_candidate_paths.end());
+        
+        if (final_k_paths.size() >= max_paths_to_find) {
+            break;
+        }
+    }
+
+    return final_k_paths;
+}
