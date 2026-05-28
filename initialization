@@ -1,0 +1,549 @@
+#include <cstddef>
+#include <iostream>
+#include <map>
+#include <set>
+#include <tuple>
+#include <vector>
+
+#include "graph.h"
+#include "optimization_solvers.h" 
+
+// =========================================================
+// Initialization Module: Routing & Resource Bootstrapping
+// =========================================================
+
+/**
+ * @brief Extracts the unique set of active physical links from a collection of routing paths.
+ * @param aggregated_paths A vector of computed network paths.
+ * @return std::set<Link> The unique subset of edges forming the active routing topology.
+ * @note Iterates through all multi-commodity paths to construct the foundational set of active links. 
+ * Time complexity is O(P * L), where P is the number of paths and L is the average path length.
+ */
+std::set<Link> extract_active_subgraph_edges(const std::vector<GraphPath>& aggregated_paths) {
+    std::set<Link> active_subgraph_edges;
+    for (const auto& path : aggregated_paths) {
+        if (path.size() < 2) continue;
+        for (std::size_t i = 0; i < path.size() - 1; ++i) {
+            int u = static_cast<int>(path[i]);
+            int v = static_cast<int>(path[i + 1]);
+            active_subgraph_edges.insert({ u, v });
+        }
+    }
+    return active_subgraph_edges;
+}
+
+/**
+ * @brief Initializes the network routing matrix using a K-Shortest Paths (KSP) uniform cold start.
+ * @param graph The network topology graph.
+ * @param topology_data The column generator containing edge definitions.
+ * @param commodity_demands Traffic demand matrix.
+ * @param num_nodes Total vertices in the graph.
+ * @param max_power_per_node Maximum transmission power constraint applied uniformly to all nodes.
+ * @param total_bandwidth_mhz The physical limit of total available spectrum in the system.
+ * @param noise_density_dbm_per_mhz Additive White Gaussian Noise (AWGN) power spectral density.
+ * @return InitializationResult Container with the constructed initial state mappings.
+ * @note Splits traffic demands uniformly across up to K optimal paths. Initializes physical 
+ * resource allocations (bandwidth and power) evenly among the resulting active links.
+ */
+InitializationResult initialize_with_ksp_uniform(
+    const Graph& graph, 
+    Col_gen topology_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes, 
+    double max_power_per_node, 
+    double total_bandwidth_mhz, 
+    double noise_density_dbm_per_mhz
+) {
+    InitializationResult result;
+    std::size_t demand_num = commodity_demands.size();
+    result.flow_routing_matrix.resize(demand_num);
+    std::vector<GraphPath> aggregated_paths;
+    
+    // Hyperparameters for path exploration
+    const int max_exploration_paths = 10;
+    const int target_k_paths = 3;
+
+    std::cout << "\n>>> [Initialization] Strategy 1: KSP Uniform Cold Start...\n";
+
+    // 1. KSP Routing and Uniform Traffic Splitting
+    std::size_t demand_idx = 0;
+    for (const auto& demand : commodity_demands) {
+        std::size_t source_node = std::get<0>(demand);
+        std::size_t target_node = std::get<1>(demand);
+        
+        auto [shortest_path, path_length] = dijkstra(graph, source_node, target_node);
+        
+        if (path_length != 0 || source_node == target_node) {
+            auto multipath_set = k_shortest_paths(target_k_paths, shortest_path, max_exploration_paths, topology_data, graph, source_node);
+            if (!multipath_set.empty()) {
+                double split_ratio = 1.0 / static_cast<double>(multipath_set.size());
+                
+                for (const auto& path : multipath_set) {
+                    if (path.size() < 2) continue;
+                    for (std::size_t i = 0; i < path.size() - 1; ++i) {
+                        Link current_link = { static_cast<int>(path[i]), static_cast<int>(path[i + 1]) };
+                        result.flow_routing_matrix[demand_idx][current_link] += split_ratio;
+                    }
+                }
+                aggregated_paths.insert(aggregated_paths.end(), multipath_set.begin(), multipath_set.end());
+            }
+        }
+        demand_idx++;
+    }
+
+    // Retain an unadulterated baseline of the KSP routing
+    result.initial_ksp_routing = result.flow_routing_matrix;
+
+    // 2. Subgraph Extraction and Resource Allocation
+    std::set<Link> active_subgraph = extract_active_subgraph_edges(aggregated_paths);
+    std::vector<double> uniform_max_powers(num_nodes, max_power_per_node);
+
+    InitialAllocation resource_alloc = initialize_resources(graph, active_subgraph, uniform_max_powers, total_bandwidth_mhz);
+    result.active_edges = resource_alloc.active_edges;
+    result.initial_power = resource_alloc.initial_power;
+    result.initial_bandwidth = resource_alloc.initial_bandwidth;
+    
+    result.initial_rate_capacity = calculate_rates(
+        graph, 
+        num_nodes, 
+        result.active_edges, 
+        result.initial_bandwidth, 
+        result.initial_power, 
+        noise_density_dbm_per_mhz, 
+        topology_data.edge_list.size(), 
+        total_bandwidth_mhz, 
+        uniform_max_powers
+    );
+
+    return result;
+}
+
+/**
+ * @brief Initializes the network routing matrix using a K-Shortest Paths (KSP) with a Dual-Decomposition Warm Start.
+ * @param graph The network topology graph.
+ * @param topology_data The column generator containing edge definitions.
+ * @param commodity_demands Traffic demand matrix.
+ * @param num_nodes Total vertices in the graph.
+ * @param max_power_per_node Maximum transmission power constraint applied uniformly to all nodes.
+ * @param fairness_alpha The scaling parameter for the alpha-fairness utility function.
+ * @param total_bandwidth_mhz The physical limit of total available spectrum in the system.
+ * @param noise_density_dbm_per_mhz AWGN power spectral density.
+ * @return InitializationResult Container with the intelligently mapped initial state mappings.
+ * @note Replaces the uniform physical resource allocation with an intelligent mapping computed 
+ * via Lagrangian Dual Decomposition (LDD), dramatically accelerating convergence in subsequent 
+ * IPM or FW algorithms.
+ */
+InitializationResult initialize_with_ksp_warm(
+    const Graph& graph, 
+    Col_gen topology_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes, 
+    double max_power_per_node, 
+    double fairness_alpha, 
+    double total_bandwidth_mhz, 
+    double noise_density_dbm_per_mhz
+) {
+    InitializationResult result;
+    std::size_t demand_num = commodity_demands.size();
+    result.flow_routing_matrix.resize(demand_num);
+    std::vector<GraphPath> aggregated_paths;
+    
+    // Hyperparameters for path exploration
+    const int max_exploration_paths = 10;
+    const int target_k_paths = 3;
+
+    // Fixed copy-paste artifact in the console output
+    std::cout << "\n>>> [Initialization] Strategy 2: KSP Warm Start (Dual Decomposition)...\n";
+
+    // 1. KSP Routing and Uniform Traffic Splitting
+    std::size_t demand_idx = 0;
+    for (const auto& demand : commodity_demands) {
+        std::size_t source_node = std::get<0>(demand);
+        std::size_t target_node = std::get<1>(demand);
+        
+        auto [shortest_path, path_length] = dijkstra(graph, source_node, target_node);
+        
+        if (path_length != 0 || source_node == target_node) {
+            auto multipath_set = k_shortest_paths(target_k_paths, shortest_path, max_exploration_paths, topology_data, graph, source_node);
+            if (!multipath_set.empty()) {
+                double split_ratio = 1.0 / static_cast<double>(multipath_set.size());
+                
+                for (const auto& path : multipath_set) {
+                    if (path.size() < 2) continue;
+                    for (std::size_t i = 0; i < path.size() - 1; ++i) {
+                        Link current_link = { static_cast<int>(path[i]), static_cast<int>(path[i + 1]) };
+                        result.flow_routing_matrix[demand_idx][current_link] += split_ratio;
+                    }
+                }
+                aggregated_paths.insert(aggregated_paths.end(), multipath_set.begin(), multipath_set.end());
+            }
+        }
+        demand_idx++;
+    }
+
+    result.initial_ksp_routing = result.flow_routing_matrix;
+
+    // 2. Core Upgrade: Execute Primal-Dual Algorithm (PDA) for Smart Warm Start
+    std::cout << "[Init] Running PDA for Smart Resource Allocation based on KSP...\n";
+    std::vector<double> uniform_max_powers(num_nodes, max_power_per_node);
+
+    // Call LDD solver with the pre-computed KSP routing matrix
+    auto smart_alloc = run_dual_decomposition_solver(
+        topology_data.edge_list, 
+        num_nodes, 
+        uniform_max_powers, 
+        total_bandwidth_mhz,
+        commodity_demands, 
+        result.initial_ksp_routing, 
+        noise_density_dbm_per_mhz, 
+        fairness_alpha, 
+        1e-2 // convergence_epsilon
+    );
+
+    // 3. Mount LDD optimal solutions to the initial state structs (Vector -> LinkMap translation)
+    result.initial_power.clear();
+    result.initial_bandwidth.clear();
+    result.initial_rate_capacity.clear();
+
+    for (std::size_t i = 0; i < topology_data.edge_list.size(); ++i) {
+        Link current_link = { static_cast<int>(std::get<0>(topology_data.edge_list[i])),
+                              static_cast<int>(std::get<1>(topology_data.edge_list[i])) };
+
+        // Safely map values back, defaulting to standard bounds to prevent mathematical faults
+        result.initial_power[current_link] = (i < smart_alloc.optimal_powers.size()) ? smart_alloc.optimal_powers[i] : 0.0;
+        result.initial_bandwidth[current_link] = (i < smart_alloc.optimal_bandwidths.size()) ? smart_alloc.optimal_bandwidths[i] : 1e-9;
+        result.initial_rate_capacity[current_link] = (i < smart_alloc.optimal_rates.size()) ? smart_alloc.optimal_rates[i] : 1e-9;
+    }
+
+    // 4. Accurately reconstruct the active edge set strictly derived from KSP
+    result.active_edges.clear();
+    for (std::size_t k = 0; k < result.initial_ksp_routing.size(); ++k) {
+        for (const auto& pair : result.initial_ksp_routing[k]) {
+            if (pair.second > 1e-5) {
+                result.active_edges.insert(pair.first);
+            }
+        }
+    }
+
+    return result;
+}
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <iostream>
+#include <map>
+#include <random>
+#include <set>
+#include <tuple>
+#include <vector>
+
+#include "graph.h"
+#include "optimization_solvers.h"
+
+// Forward declaration if not in header
+std::set<Link> extract_active_subgraph_edges(const std::vector<GraphPath>& aggregated_paths);
+
+/**
+ * @brief Initializes the network routing matrix using K-Shortest Paths (KSP) and allocates resources via an Iterative Potential Game.
+ * @param graph The network topology graph.
+ * @param topology_data The column generator containing edge definitions.
+ * @param commodity_demands Traffic demand matrix.
+ * @param num_nodes Total vertices in the graph.
+ * @param max_power_per_node Maximum transmission power constraint per node.
+ * @param fairness_alpha User utility fairness parameter (carried over for signature consistency, though not strictly used in greedy delay minimization).
+ * @param total_bandwidth_mhz Total available spectrum bandwidth.
+ * @param noise_density_dbm_per_mhz AWGN power spectral density.
+ * @return InitializationResult Container with the initial states evaluated via the potential game.
+ * @note Heuristically distributes bandwidth uniformly among active links and optimizes power 
+ * allocation using a randomized potential game to minimize total expected delay.
+ */
+InitializationResult initialize_with_ksp_game(
+    const Graph& graph,
+    const Col_gen& topology_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes,
+    double max_power_per_node,
+    double fairness_alpha, 
+    double total_bandwidth_mhz,
+    double noise_density_dbm_per_mhz
+) {
+    InitializationResult result;
+    std::size_t demand_num = commodity_demands.size();
+    result.flow_routing_matrix.resize(demand_num);
+    std::vector<GraphPath> aggregated_paths;
+    
+    const int max_exploration_paths = 10;
+    const int target_k_paths = 3;
+
+    std::cout << "\n>>> [Initialization] Strategy 3: KSP Routing + Game-Greedy Allocation...\n";
+
+    // ==========================================
+    // 1. KSP Routing and Uniform Traffic Splitting
+    // ==========================================
+    std::size_t demand_idx = 0;
+    for (const auto& demand : commodity_demands) {
+        std::size_t source_node = std::get<0>(demand);
+        std::size_t target_node = std::get<1>(demand);
+        
+        auto [shortest_path, path_length] = dijkstra(graph, source_node, target_node);
+        if (path_length != 0 || source_node == target_node) {
+            auto multipath_set = k_shortest_paths(target_k_paths, shortest_path, max_exploration_paths, topology_data, graph, source_node);
+            if (!multipath_set.empty()) {
+                double split_ratio = 1.0 / static_cast<double>(multipath_set.size());
+                for (const auto& path : multipath_set) {
+                    if (path.size() < 2) continue;
+                    for (std::size_t i = 0; i < path.size() - 1; ++i) {
+                        Link current_link = { static_cast<int>(path[i]), static_cast<int>(path[i + 1]) };
+                        result.flow_routing_matrix[demand_idx][current_link] += split_ratio;
+                        result.active_edges.insert(current_link); 
+                    }
+                }
+                aggregated_paths.insert(aggregated_paths.end(), multipath_set.begin(), multipath_set.end());
+            }
+        }
+        demand_idx++;
+    }
+
+    result.initial_ksp_routing = result.flow_routing_matrix;
+
+    // ==========================================
+    // 2. Physical Graph Pre-processing
+    // ==========================================
+    std::size_t num_edges = topology_data.edge_list.size();
+    double noise_power_spectral_density_w_mhz = std::pow(10.0, (noise_density_dbm_per_mhz - 30.0) / 10.0);
+    const double kEps = 1e-9;
+
+    std::vector<std::vector<std::pair<int, int>>> adjacency_indices(num_nodes);
+    std::vector<double> channel_gains(num_edges);
+    std::vector<int> out_degrees(num_nodes, 0);
+    std::map<Link, int> link_to_index_map;
+
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        int u = static_cast<int>(std::get<0>(topology_data.edge_list[e]));
+        int v = static_cast<int>(std::get<1>(topology_data.edge_list[e]));
+        Link current_link = { u, v };
+        
+        link_to_index_map[current_link] = static_cast<int>(e);
+        adjacency_indices[u].emplace_back(v, static_cast<int>(e));
+        out_degrees[u]++;
+
+        double distance_meters = std::get<2>(topology_data.edge_list[e]);
+        double distance_km = std::max(0.001, distance_meters / 1000.0);
+        double path_loss_db = 128.1 + 37.6 * std::log10(distance_km);
+        channel_gains[e] = std::pow(10.0, -path_loss_db / 10.0);
+    }
+
+    std::vector<double> actual_flow_volumes(num_edges, 0.0);
+    int active_edge_count = 0;
+    
+    for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+        double traffic_volume = std::get<2>(commodity_demands[k]);
+        for (const auto& pair : result.initial_ksp_routing[k]) {
+            if (pair.second > kEps && link_to_index_map.count(pair.first)) {
+                int e = link_to_index_map[pair.first];
+                actual_flow_volumes[e] += pair.second * traffic_volume;
+            }
+        }
+    }
+    
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        if (actual_flow_volumes[e] > kEps) {
+            active_edge_count++;
+        }
+    }
+
+    // ==========================================
+    // 3. Heuristic Resource Initialization
+    // ==========================================
+    std::vector<double> power_vector(num_edges, 0.0);
+    std::vector<double> bandwidth_vector(num_edges, kEps);
+    double bandwidth_per_active_edge = (active_edge_count > 0) ? (total_bandwidth_mhz / active_edge_count) : 0.0;
+
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        int u = static_cast<int>(std::get<0>(topology_data.edge_list[e]));
+        if (actual_flow_volumes[e] > kEps) {
+            bandwidth_vector[e] = bandwidth_per_active_edge;
+            power_vector[e] = max_power_per_node / std::max(1, out_degrees[u]);
+        }
+    }
+
+    // ==========================================
+    // 4. Iterative Potential Game Optimization
+    // ==========================================
+    auto eval_total_delay = [&]() -> double {
+        double sum_delay = 0.0;
+        for (std::size_t e = 0; e < num_edges; ++e) {
+            if (actual_flow_volumes[e] > kEps) {
+                double snr = (power_vector[e] * channel_gains[e]) / (noise_power_spectral_density_w_mhz * bandwidth_vector[e]);
+                double capacity = bandwidth_vector[e] * std::log2(1.0 + snr);
+                sum_delay += actual_flow_volumes[e] / std::max(capacity, kEps);
+            }
+        }
+        return sum_delay;
+    };
+
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<double> rand_ratio(0.05, 0.3);
+    double current_objective = eval_total_delay();
+
+    for (int iter = 0; iter < 50; ++iter) {
+        bool globally_improved = false;
+        for (int u = 0; u < num_nodes; ++u) {
+            std::vector<int> active_adjacent_edges;
+            for (const auto& edge : adjacency_indices[u]) {
+                if (actual_flow_volumes[edge.second] > kEps) {
+                    active_adjacent_edges.push_back(edge.second);
+                }
+            }
+            if (active_adjacent_edges.size() >= 2) {
+                int e1 = active_adjacent_edges[rng() % active_adjacent_edges.size()];
+                int e2 = active_adjacent_edges[rng() % active_adjacent_edges.size()];
+                if (e1 == e2) continue;
+
+                double power_delta = power_vector[e1] * rand_ratio(rng);
+                power_vector[e1] -= power_delta;
+                power_vector[e2] += power_delta;
+
+                double new_objective = eval_total_delay();
+                if (new_objective < current_objective - 1e-5) {
+                    current_objective = new_objective;
+                    globally_improved = true;
+                } else {
+                    // Revert power shift
+                    power_vector[e1] += power_delta;
+                    power_vector[e2] -= power_delta;
+                }
+            }
+        }
+        if (!globally_improved) break;
+    }
+
+    // ==========================================
+    // 5. Package to InitializationResult
+    // ==========================================
+    for (std::size_t e = 0; e < num_edges; ++e) {
+        Link current_link = { static_cast<int>(std::get<0>(topology_data.edge_list[e])), 
+                              static_cast<int>(std::get<1>(topology_data.edge_list[e])) };
+
+        result.initial_power[current_link] = power_vector[e];
+        result.initial_bandwidth[current_link] = bandwidth_vector[e];
+
+        if (actual_flow_volumes[e] > kEps) {
+            double snr = (power_vector[e] * channel_gains[e]) / (noise_power_spectral_density_w_mhz * bandwidth_vector[e]);
+            result.initial_rate_capacity[current_link] = std::max(bandwidth_vector[e] * std::log2(1.0 + snr), kEps);
+        } else {
+            result.initial_rate_capacity[current_link] = kEps;
+        }
+    }
+
+    return result;
+}
+
+
+/**
+ * @brief Bootstraps the optimization using the Game-Greedy Baseline (GGB) as a warm start, followed by active subgraph expansion.
+ * @param graph The network topology graph.
+ * @param topology_data The column generator containing edge definitions.
+ * @param commodity_demands Traffic demand matrix.
+ * @param num_nodes Total vertices in the graph.
+ * @param max_power_per_node Maximum transmission power per node.
+ * @param total_bandwidth_mhz Total available spectrum bandwidth.
+ * @param noise_density_dbm_per_mhz AWGN power spectral density.
+ * @return InitializationResult Structure primed with the GGB heuristic solutions.
+ */
+InitializationResult initialize_with_ggb_warm_start(
+    const Graph& graph, 
+    Col_gen topology_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes, 
+    double max_power_per_node, 
+    double total_bandwidth_mhz, 
+    double noise_density_dbm_per_mhz
+) {
+    InitializationResult result;
+    std::size_t demand_num = commodity_demands.size();
+    std::vector<double> uniform_max_powers(num_nodes, max_power_per_node);
+    
+    // Virtual capacity floor to prevent singularity in subsequent barrier methods
+    const double kVirtualRateMin = 0.05; 
+
+    std::cout << "\n>>> [Initialization] Strategy 4: GGB Warm Start + Subgraph Expansion...\n";
+
+    // Step A: Extract KSP Backbone
+    std::vector<GraphPath> aggregated_paths;
+    const int max_exploration_paths = 10;
+    const int target_k_paths = 3;
+    result.initial_ksp_routing.resize(demand_num); 
+
+    std::size_t demand_idx = 0;
+    for (const auto& demand : commodity_demands) {
+        std::size_t source_node = std::get<0>(demand);
+        std::size_t target_node = std::get<1>(demand);
+        
+        auto [shortest_path, path_length] = dijkstra(graph, source_node, target_node);
+        if (path_length != 0 || source_node == target_node) {
+            auto multipath_set = k_shortest_paths(target_k_paths, shortest_path, max_exploration_paths, topology_data, graph, source_node);
+            if (!multipath_set.empty()) {
+                double split_ratio = 1.0 / static_cast<double>(multipath_set.size());
+                for (const auto& path : multipath_set) {
+                    if (path.size() < 2) continue;
+                    for (std::size_t i = 0; i < path.size() - 1; ++i) {
+                        Link current_link = { static_cast<int>(path[i]), static_cast<int>(path[i + 1]) };
+                        result.initial_ksp_routing[demand_idx][current_link] += split_ratio;
+                    }
+                }
+                aggregated_paths.insert(aggregated_paths.end(), multipath_set.begin(), multipath_set.end());
+            }
+        }
+        demand_idx++;
+    }
+    
+    // Assuming extract_active_subgraph_edges is defined/declared based on the previous file
+    result.active_edges = extract_active_subgraph_edges(aggregated_paths);
+
+    // Step B: Execute the Game-Theoretic Greedy Baseline for initial allocation
+    OptimizationResult ggb_baseline_result = run_game_greedy_baseline(
+        topology_data.edge_list, 
+        num_nodes, 
+        uniform_max_powers, 
+        total_bandwidth_mhz, 
+        commodity_demands, 
+        noise_density_dbm_per_mhz
+    );
+    
+    result.flow_routing_matrix = ggb_baseline_result.final_flow_routing;
+
+    // Step C: State Fusion - Bridge the Greedy Allocation into the Initialization Structure
+    for (const auto& current_link : result.active_edges) {
+        result.initial_power[current_link] = 0.0;
+        result.initial_bandwidth[current_link] = 0.0;
+        result.initial_rate_capacity[current_link] = kVirtualRateMin;
+    }
+
+    for (std::size_t i = 0; i < topology_data.edge_list.size(); ++i) {
+        Link current_link = { static_cast<int>(std::get<0>(topology_data.edge_list[i])), 
+                              static_cast<int>(std::get<1>(topology_data.edge_list[i])) };
+                              
+        if (ggb_baseline_result.optimal_rates[i] > 1e-6) {
+            result.active_edges.insert(current_link);
+            result.initial_power[current_link] = ggb_baseline_result.optimal_powers[i];
+            result.initial_bandwidth[current_link] = ggb_baseline_result.optimal_bandwidths[i];
+            result.initial_rate_capacity[current_link] = std::max(ggb_baseline_result.optimal_rates[i], kVirtualRateMin);
+        }
+    }
+
+    for (std::size_t k = 0; k < demand_num; ++k) {
+        for (const auto& pair : result.flow_routing_matrix[k]) {
+            if (pair.second > 1e-4) {
+                Link current_link = pair.first;
+                result.active_edges.insert(current_link);
+                if (result.initial_rate_capacity[current_link] < kVirtualRateMin) {
+                    result.initial_rate_capacity[current_link] = kVirtualRateMin;
+                }
+            }
+        }
+    }
+
+    return result;
+}
