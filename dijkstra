@@ -16,91 +16,91 @@
  * @param blocked_u The source node of an explicitly blocked edge.
  * @param blocked_v The destination node of an explicitly blocked edge.
  * @param ignored_nodes A list of node indices to be completely excluded from the routing.
- * @return std::pair<GraphPath, double> A tuple containing the shortest path as a sequence of nodes, and the total path cost. 
+ * @return std::pair<GraphPath, double> A tuple containing the shortest path as a sequence of nodes, and the total path cost.
  * Returns an empty path and infinity if the destination is unreachable.
- * @note 
+ * @note
  * Algorithm Complexity & Mathematical Steps:
  * 1. Priority Queue Initialization: O((V + E) log V) complexity. Distances are initialized to infinity.
  * 2. Constraint Checking: Evaluates every neighbor against the explicitly blocked edge (u->v) and the ignored nodes vector.
  * 3. Path Backtracking: Reconstructs the optimal sequence in O(V) time from the destination marker strictly without duplicating the source node.
  */
 std::pair<GraphPath, double> dijkstra(
-    const Graph& graph,
-    size_t src,
-    size_t dest,
-    size_t blocked_u,
-    size_t blocked_v,
-    const std::vector<size_t>& ignored_nodes
+	const Graph& graph,
+	size_t src,
+	size_t dest,
+	size_t blocked_u,
+	size_t blocked_v,
+	const std::vector<size_t>& ignored_nodes
 ) {
-    size_t total_nodes = graph.adj.size();
+	size_t total_nodes = graph.adj.size();
 
-    std::vector<bool> is_visited(total_nodes, false);
-    std::vector<double> shortest_distances(total_nodes, std::numeric_limits<double>::max());
-    std::vector<size_t> parent_nodes(total_nodes, std::numeric_limits<size_t>::max());
+	std::vector<bool> is_visited(total_nodes, false);
+	std::vector<double> shortest_distances(total_nodes, std::numeric_limits<double>::max());
+	std::vector<size_t> parent_nodes(total_nodes, std::numeric_limits<size_t>::max());
 
-    shortest_distances[src] = 0;
+	shortest_distances[src] = 0;
 
-    using DistanceNodePair = std::pair<size_t, double>;
-    auto distance_comparator = [](const DistanceNodePair& lhs, const DistanceNodePair& rhs) { 
-        return lhs.second > rhs.second; 
-    };
-    std::priority_queue<DistanceNodePair, std::vector<DistanceNodePair>, decltype(distance_comparator)> min_cost_queue(distance_comparator);
-    min_cost_queue.push(std::make_pair(src, shortest_distances[src]));
+	using DistanceNodePair = std::pair<size_t, double>;
+	auto distance_comparator = [](const DistanceNodePair & lhs, const DistanceNodePair & rhs) {
+		return lhs.second > rhs.second;
+	};
+	std::priority_queue<DistanceNodePair, std::vector<DistanceNodePair>, decltype(distance_comparator)> min_cost_queue(distance_comparator);
+	min_cost_queue.push(std::make_pair(src, shortest_distances[src]));
 
-    while (!min_cost_queue.empty()) {
-        size_t current_node = min_cost_queue.top().first;
-        double current_distance = min_cost_queue.top().second;
-        min_cost_queue.pop();
+	while (!min_cost_queue.empty()) {
+		size_t current_node = min_cost_queue.top().first;
+		double current_distance = min_cost_queue.top().second;
+		min_cost_queue.pop();
 
-        if (current_distance > shortest_distances[current_node]) continue;
-        if (is_visited[current_node]) continue;
-        is_visited[current_node] = true;
+		if (current_distance > shortest_distances[current_node]) continue;
+		if (is_visited[current_node]) continue;
+		is_visited[current_node] = true;
 
-        if (current_node == dest) break;
+		if (current_node == dest) break;
 
-        for (const auto& edge : graph.adj[current_node]) {
-            size_t neighbor_node = static_cast<size_t>(edge.first);
-            double edge_weight = edge.second;
+		for (const auto& edge : graph.adj[current_node]) {
+			size_t neighbor_node = static_cast<size_t>(edge.first);
+			double edge_weight = edge.second;
 
-            if (current_node == blocked_u && neighbor_node == blocked_v) continue;
+			if (current_node == blocked_u && neighbor_node == blocked_v) continue;
 
-            bool is_ignored = false;
-            for (size_t ignored_idx : ignored_nodes) {
-                if (neighbor_node == ignored_idx) {
-                    is_ignored = true;
-                    break;
-                }
-            }
-            if (is_ignored) continue;
+			bool is_ignored = false;
+			for (size_t ignored_idx : ignored_nodes) {
+				if (neighbor_node == ignored_idx) {
+					is_ignored = true;
+					break;
+				}
+			}
+			if (is_ignored) continue;
 
-            double marginal_distance = shortest_distances[current_node] + edge_weight;
-            if (shortest_distances[neighbor_node] > marginal_distance) {
-                shortest_distances[neighbor_node] = marginal_distance;
-                parent_nodes[neighbor_node] = current_node;
-                min_cost_queue.push(std::make_pair(neighbor_node, marginal_distance));
-            }
-        }
-    }
+			double marginal_distance = shortest_distances[current_node] + edge_weight;
+			if (shortest_distances[neighbor_node] > marginal_distance) {
+				shortest_distances[neighbor_node] = marginal_distance;
+				parent_nodes[neighbor_node] = current_node;
+				min_cost_queue.push(std::make_pair(neighbor_node, marginal_distance));
+			}
+		}
+	}
 
-    if (!is_visited[dest]) return { {}, std::numeric_limits<double>::max() };
+	if (!is_visited[dest]) return { {}, std::numeric_limits<double>::max() };
 
-    GraphPath optimal_path;
-    size_t tracer_node = dest;
-    optimal_path.push_back(dest);
+	GraphPath optimal_path;
+	size_t tracer_node = dest;
+	optimal_path.push_back(dest);
 
-    while (tracer_node != src) {
-        size_t previous_node = parent_nodes[tracer_node];
-        if (previous_node == std::numeric_limits<size_t>::max()) {
-            return { {}, std::numeric_limits<double>::max() };
-        }
+	while (tracer_node != src) {
+		size_t previous_node = parent_nodes[tracer_node];
+		if (previous_node == std::numeric_limits<size_t>::max()) {
+			return { {}, std::numeric_limits<double>::max() };
+		}
 
-        optimal_path.push_back(previous_node); 
-        tracer_node = previous_node;
-    }
+		optimal_path.push_back(previous_node);
+		tracer_node = previous_node;
+	}
 
-    std::reverse(optimal_path.begin(), optimal_path.end());
+	std::reverse(optimal_path.begin(), optimal_path.end());
 
-    return { optimal_path, shortest_distances[dest] };
+	return { optimal_path, shortest_distances[dest] };
 }
 
 /**
@@ -117,50 +117,50 @@ std::pair<GraphPath, double> dijkstra(
  * 3. Forward Graph Search: O((V + E) log V) via standard min-priority queue extraction.
  */
 std::pair<GraphPath, double> dijkstra(
-    const Graph& graph,
-    size_t src,
-    size_t dest,
-    const std::map<Link, double>& dynamic_weights
+	const Graph& graph,
+	size_t src,
+	size_t dest,
+	const std::map<Link, double>& dynamic_weights
 ) {
-    size_t total_nodes = graph.adj.size();
-    std::vector<double> shortest_distances(total_nodes, std::numeric_limits<double>::infinity());
-    std::vector<int> parent_nodes(total_nodes, -1);
+	size_t total_nodes = graph.adj.size();
+	std::vector<double> shortest_distances(total_nodes, std::numeric_limits<double>::infinity());
+	std::vector<int> parent_nodes(total_nodes, -1);
 
-    std::priority_queue<std::pair<double, size_t>, std::vector<std::pair<double, size_t>>, std::greater<>> min_cost_queue;
+	std::priority_queue<std::pair<double, size_t>, std::vector<std::pair<double, size_t>>, std::greater<>> min_cost_queue;
 
-    shortest_distances[src] = 0.0;
-    min_cost_queue.push({ 0.0, src });
+	shortest_distances[src] = 0.0;
+	min_cost_queue.push({ 0.0, src });
 
-    while (!min_cost_queue.empty()) {
-        auto [current_distance, current_node] = min_cost_queue.top();
-        min_cost_queue.pop();
+	while (!min_cost_queue.empty()) {
+		auto [current_distance, current_node] = min_cost_queue.top();
+		min_cost_queue.pop();
 
-        if (current_distance > shortest_distances[current_node]) continue;
-        if (current_node == dest) break; 
+		if (current_distance > shortest_distances[current_node]) continue;
+		if (current_node == dest) break;
 
-        for (const auto& edge : graph.adj[current_node]) {
-            size_t neighbor_node = static_cast<size_t>(edge.first); 
-            Link current_link = { static_cast<int>(current_node), static_cast<int>(neighbor_node) };
+		for (const auto& edge : graph.adj[current_node]) {
+			size_t neighbor_node = static_cast<size_t>(edge.first);
+			Link current_link = { static_cast<int>(current_node), static_cast<int>(neighbor_node) };
 
-            double edge_weight = dynamic_weights.count(current_link) ? dynamic_weights.at(current_link) : std::numeric_limits<double>::infinity();
+			double edge_weight = dynamic_weights.count(current_link) ? dynamic_weights.at(current_link) : std::numeric_limits<double>::infinity();
 
-            if (edge_weight != std::numeric_limits<double>::infinity() && shortest_distances[current_node] + edge_weight < shortest_distances[neighbor_node]) {
-                shortest_distances[neighbor_node] = shortest_distances[current_node] + edge_weight;
-                parent_nodes[neighbor_node] = static_cast<int>(current_node);
-                min_cost_queue.push({ shortest_distances[neighbor_node], neighbor_node });
-            }
-        }
-    }
+			if (edge_weight != std::numeric_limits<double>::infinity() && shortest_distances[current_node] + edge_weight < shortest_distances[neighbor_node]) {
+				shortest_distances[neighbor_node] = shortest_distances[current_node] + edge_weight;
+				parent_nodes[neighbor_node] = static_cast<int>(current_node);
+				min_cost_queue.push({ shortest_distances[neighbor_node], neighbor_node });
+			}
+		}
+	}
 
-    GraphPath optimal_path; 
-    if (shortest_distances[dest] == std::numeric_limits<double>::infinity()) {
-        return { optimal_path, 0.0 }; 
-    }
+	GraphPath optimal_path;
+	if (shortest_distances[dest] == std::numeric_limits<double>::infinity()) {
+		return { optimal_path, 0.0 };
+	}
 
-    for (int tracer_node = static_cast<int>(dest); tracer_node != -1; tracer_node = parent_nodes[tracer_node]) {
-        optimal_path.push_back(static_cast<size_t>(tracer_node));
-    }
-    std::reverse(optimal_path.begin(), optimal_path.end());
+	for (int tracer_node = static_cast<int>(dest); tracer_node != -1; tracer_node = parent_nodes[tracer_node]) {
+		optimal_path.push_back(static_cast<size_t>(tracer_node));
+	}
+	std::reverse(optimal_path.begin(), optimal_path.end());
 
-    return { optimal_path, shortest_distances[dest] };
+	return { optimal_path, shortest_distances[dest] };
 }
