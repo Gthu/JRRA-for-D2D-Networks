@@ -1,56 +1,55 @@
-#include "graph.h"
-#include <iostream>
-#include <vector>
-#include <map>
-#include <set>
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <map>
 #include <numeric>
+#include <set>
+#include <vector>
 
-// Utilizing constexpr for compile-time constant evaluation (Google C++ Style)
-constexpr double kMinKeepAlivePower = 1e-13;  // -100 dBm = 0.1 pW (Minimal threshold to maintain connectivity)
-constexpr double kMinBandwidthRatio = 1e-6;   // One-millionth of the total spectrum per inactive link
+#include "graph.h"
+
+// ==========================================
+// Keep-Alive Epsilon Constants
+// ==========================================
+constexpr double kEpsilonPowerWatts = 1e-13;        // -100 dBm = 0.1 pW (Maintains connectivity without interference)
+constexpr double kEpsilonBandwidthRatio = 1e-6;     // Fractional bandwidth reservation for inactive links
 
 /**
- * @brief Initializes power and bandwidth resources using a mathematical Keep-Alive strategy.
- * 
- * @param graph The complete network topology.
- * @param active_subgraph_edges The set of active links pre-selected by the routing phase.
- * @param node_power_limits The maximum power budget available at each individual node.
- * @param total_bandwidth_spectrum The total system bandwidth available for allocation.
- * @return InitialAllocation Struct containing the initialized power (p0) and bandwidth (l0) states.
- * 
- * @note Implements an epsilon-reservation heuristic: Active links receive the majority of the resources, 
- * while inactive links receive a marginal epsilon value. This mathematically guarantees strict positivity 
- * across the network, preventing gradient vanishing and division-by-zero singularities 
- * in the subsequent Interior Point Method (IPM) or Frank-Wolfe optimization phases.
+ * @brief Initializes physical resources (power and bandwidth) using a strict Keep-Alive strategy.
+ * * @param graph The complete network topology graph.
+ * @param active_subgraph The logical subset of active links computed via routing algorithms (e.g., KSP).
+ * @param node_max_powers Vector containing the maximum transmission power budget for each node.
+ * @param total_bandwidth_mhz The physical limit of total available spectrum in the system.
+ * @return InitialAllocation Structure containing the safely initialized active edges, power, and bandwidth mappings.
+ * * @note This strategy prevents gradient vanishing and log(0) singularities in barrier-based optimization 
+ * solvers (like IPM). It allocates the majority of resources to active links while injecting an infinitesimally 
+ * small \epsilon resource to inactive links. Includes mathematical safeguards against budget overflow and 
+ * zero-division faults. Time complexity is bounded by O(V + E).
  */
 InitialAllocation initialize_resources(
     const Graph& graph,                
-    const std::set<Link>& active_subgraph_edges, 
-    const std::vector<double>& node_power_limits,
-    double total_bandwidth_spectrum
+    const std::set<Link>& active_subgraph, 
+    const std::vector<double>& node_max_powers,
+    double total_bandwidth_mhz
 ) {
     InitialAllocation result;
-    result.E_active = active_subgraph_edges; 
+    result.active_edges = active_subgraph; 
 
-    size_t num_nodes = node_power_limits.size(); 
+    std::size_t num_nodes = node_max_powers.size(); 
 
-    std::cout << "[Resource Initialization] Applying Keep-Alive Strategy...\n";
-    std::cout << "  -> Active Links (|E_subgraph|): " << result.E_active.size() << "\n";
-
-    // =========================================================
-    // Phase 1: Initial Power Allocation (p0)
-    // =========================================================
-    for (size_t u = 0; u < num_nodes; ++u) {
+    // ==========================================
+    // Phase 1: Initial Power Allocation (Watts)
+    // ==========================================
+    for (std::size_t u = 0; u < num_nodes; ++u) {
         std::vector<int> active_neighbors;
         std::vector<int> inactive_neighbors;
 
         if (u < graph.adj.size()) {
             for (const auto& edge : graph.adj[u]) {
                 int v = edge.first;
-                Link link = { static_cast<int>(u), v };
+                Link current_link = { static_cast<int>(u), v };
 
-                if (result.E_active.count(link)) {
+                if (result.active_edges.count(current_link)) {
                     active_neighbors.push_back(v);
                 } else {
                     inactive_neighbors.push_back(v);
@@ -58,100 +57,102 @@ InitialAllocation initialize_resources(
             }
         }
 
-        double total_power_budget = node_power_limits[u];
-        size_t n_active = active_neighbors.size();
-        size_t n_inactive = inactive_neighbors.size();
-        size_t n_total = n_active + n_inactive;
+        double total_node_power = node_max_powers[u];
+        std::size_t active_count = active_neighbors.size();
+        std::size_t inactive_count = inactive_neighbors.size();
+        std::size_t total_degree = active_count + inactive_count;
 
-        if (n_total == 0) continue; // Bypass isolated nodes safely
-
-        // Case A: Node has no active physical links (Fallback Protection)
-        if (n_active == 0) {
-            double fallback_power = kMinKeepAlivePower;  
-            for (int v : inactive_neighbors) {
-                result.p0[{static_cast<int>(u), v}] = fallback_power;
-            }
+        if (total_degree == 0) {
+            continue; // Isolated node bypass
         }
-        // Case B: Normal distribution over active and inactive sets
-        else {
-            double reserved_power = n_inactive * kMinKeepAlivePower;
 
-            // Budget constraint validation: compress epsilon if reserved power exceeds the total budget
-            if (reserved_power >= total_power_budget) {
-                double uniform_power = total_power_budget / static_cast<double>(n_total);
-                for (int v : active_neighbors) result.p0[{static_cast<int>(u), v}] = uniform_power;
-                for (int v : inactive_neighbors) result.p0[{static_cast<int>(u), v}] = uniform_power;
+        // --- Allocation Logic Branching ---
+
+        // Case A: Node has no active outgoing links.
+        // Strategy: Provide epsilon to all physical links to maintain gradient pathways.
+        if (active_count == 0) {
+            for (int v : inactive_neighbors) {
+                result.initial_power[{static_cast<int>(u), v}] = kEpsilonPowerWatts;
+            }
+        } 
+        // Case B: Normal operation (Node has active links).
+        else {
+            double reserved_inactive_power = static_cast<double>(inactive_count) * kEpsilonPowerWatts;
+
+            // Budget Audit: Fallback to uniform distribution if epsilon reservation exceeds total budget (extreme edge case)
+            if (reserved_inactive_power >= total_node_power) {
+                double fallback_power_per_link = total_node_power / static_cast<double>(total_degree);
+                for (int v : active_neighbors) result.initial_power[{static_cast<int>(u), v}] = fallback_power_per_link;
+                for (int v : inactive_neighbors) result.initial_power[{static_cast<int>(u), v}] = fallback_power_per_link;
             } else {
-                double remaining_power = total_power_budget - reserved_power;
-                double active_link_power = remaining_power / static_cast<double>(n_active);
+                // Standard Keep-Alive Allocation
+                double remaining_power = total_node_power - reserved_inactive_power;
+                double power_per_active_link = remaining_power / static_cast<double>(active_count);
 
                 for (int v : active_neighbors) {
-                    result.p0[{static_cast<int>(u), v}] = active_link_power;
+                    result.initial_power[{static_cast<int>(u), v}] = power_per_active_link;
                 }
                 for (int v : inactive_neighbors) {
-                    result.p0[{static_cast<int>(u), v}] = kMinKeepAlivePower;
+                    result.initial_power[{static_cast<int>(u), v}] = kEpsilonPowerWatts;
                 }
             }
         }
     }
 
-    // =========================================================
-    // Phase 2: Initial Spectrum/Bandwidth Allocation (l0)
-    // =========================================================
-    size_t total_active_links = result.E_active.size();
-    size_t total_inactive_links = 0;
+    // ==========================================
+    // Phase 2: Initial Bandwidth Allocation (MHz)
+    // ==========================================
+    std::size_t total_active_links = result.active_edges.size();
+    std::size_t total_inactive_links = 0;
 
-    for (size_t u = 0; u < num_nodes; ++u) {
+    // Fast census of inactive links across the topology
+    for (std::size_t u = 0; u < num_nodes; ++u) {
         if (u < graph.adj.size()) {
             for (const auto& edge : graph.adj[u]) {
                 int v = edge.first;
-                if (result.E_active.find({ static_cast<int>(u), v }) == result.E_active.end()) {
+                if (result.active_edges.find({ static_cast<int>(u), v }) == result.active_edges.end()) {
                     total_inactive_links++;
                 }
             }
         }
     }
 
-    double epsilon_bandwidth = total_bandwidth_spectrum * kMinBandwidthRatio;
-    double total_reserved_bandwidth = total_inactive_links * epsilon_bandwidth;
+    double epsilon_bandwidth = total_bandwidth_mhz * kEpsilonBandwidthRatio;
+    double total_reserved_bandwidth = static_cast<double>(total_inactive_links) * epsilon_bandwidth;
 
-    double bandwidth_per_active = 0.0;
-    double bandwidth_per_inactive = 0.0;
+    double active_link_bandwidth = 0.0;
+    double inactive_link_bandwidth = 0.0;
 
-    // Global budget constraint validation
-    if (total_reserved_bandwidth >= total_bandwidth_spectrum) {
-        std::cout << "[Warning] Bandwidth budget insufficient for Keep-Alive. Reverting to uniform allocation.\n";
-        size_t total_links = total_active_links + total_inactive_links;
-        double uniform_bandwidth = total_bandwidth_spectrum / static_cast<double>(total_links > 0 ? total_links : 1);
-        bandwidth_per_active = uniform_bandwidth;
-        bandwidth_per_inactive = uniform_bandwidth;
+    // Budget Audit: Guard against network-wide bandwidth starvation
+    if (total_reserved_bandwidth >= total_bandwidth_mhz) {
+        std::size_t total_links = total_active_links + total_inactive_links;
+        double uniform_bandwidth = total_bandwidth_mhz / static_cast<double>(total_links > 0 ? total_links : 1);
+        active_link_bandwidth = uniform_bandwidth;
+        inactive_link_bandwidth = uniform_bandwidth;
     } else {
-        bandwidth_per_inactive = epsilon_bandwidth;
+        inactive_link_bandwidth = epsilon_bandwidth;
         if (total_active_links > 0) {
-            bandwidth_per_active = (total_bandwidth_spectrum - total_reserved_bandwidth) / static_cast<double>(total_active_links);
+            active_link_bandwidth = (total_bandwidth_mhz - total_reserved_bandwidth) / static_cast<double>(total_active_links);
         } else {
-            bandwidth_per_active = 0.0; 
+            active_link_bandwidth = 0.0; // Fail-safe
         }
     }
 
-    // Map bandwidth assignments across the entire physical topology
-    for (size_t u = 0; u < num_nodes; ++u) {
+    // Physical Mapping: Assign computed bandwidths globally
+    for (std::size_t u = 0; u < num_nodes; ++u) {
         if (u < graph.adj.size()) {
             for (const auto& edge : graph.adj[u]) {
                 int v = edge.first;
-                Link link = { static_cast<int>(u), v };
+                Link current_link = { static_cast<int>(u), v };
 
-                if (result.E_active.count(link)) {
-                    result.l0[link] = bandwidth_per_active;
+                if (result.active_edges.count(current_link)) {
+                    result.initial_bandwidth[current_link] = active_link_bandwidth;
                 } else {
-                    result.l0[link] = bandwidth_per_inactive;
+                    result.initial_bandwidth[current_link] = inactive_link_bandwidth;
                 }
             }
         }
     }
-
-    std::cout << "  -> Initial allocation complete.\n";
-    std::cout << "  -> Active link B: " << bandwidth_per_active << " MHz, Inactive link B: " << bandwidth_per_inactive << " MHz\n";
 
     return result;
 }
