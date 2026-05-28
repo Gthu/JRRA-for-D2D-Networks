@@ -1,0 +1,791 @@
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <iostream>
+#include <map>
+#include <tuple>
+#include <vector>
+
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <Eigen/SparseCholesky>
+#include <Eigen/SparseLU> 
+
+#include "graph.h" 
+#include "optimization_solvers.h"
+
+using namespace Eigen;
+
+// =========================================================
+// Mathematical and Mapping Utilities
+// =========================================================
+
+/**
+ * @brief Utility struct mapping 3D indices (commodity, source, target) to 1D vector indices.
+ * @note Critical for unrolling the multi-commodity network flow constraints into flat 
+ * sparse matrices for Eigen solvers.
+ */
+struct IndexMap {
+    int num_commodities;
+    int num_edges;
+    int num_nodes;
+    std::vector<Link> physical_edges;
+
+    // Primal vector x index mapping: i = k * E + e
+    inline int get_primal_x_idx(int k, int e) const { 
+        return k * num_edges + e; 
+    }
+    
+    // Dual vector y index mapping: i = k * V + v
+    inline int get_dual_y_idx(int k, int v) const { 
+        return k * num_nodes + v; 
+    }
+};
+
+// =========================================================
+// Interior Point Method (IPM) Routing Solver (Part 1)
+// =========================================================
+
+/**
+ * @brief Executes a Primal-Dual Interior Point Method (IPM) solver to optimize multi-commodity flow routing.
+ * @note Directly computes the exact descent direction by inverting the KKT matrix. Serves as a 
+ * second-order alternative to the Frank-Wolfe algorithm, typically converging in fewer iterations 
+ * but requiring heavier per-iteration matrix computations.
+ */
+void solve_ipm_routing(
+    const Graph& graph,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list, 
+    int num_nodes,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,          
+    const LinkMap& rate_capacities, 
+    const LinkMap& power_allocations, 
+    std::vector<std::map<Link, double>>& flow_routing_matrix, 
+    IPMConfig config,
+    double fairness_alpha
+) {
+    int num_commodities = commodity_demands.size();
+    int num_physical_edges = edge_list.size();
+    int V = num_nodes;
+
+    IndexMap idx_map{ num_commodities, num_physical_edges, V };
+    for (const auto& edge : edge_list) {
+        idx_map.physical_edges.push_back({ static_cast<int>(std::get<0>(edge)), static_cast<int>(std::get<1>(edge)) });
+    }
+
+    int total_primal_vars = num_commodities * num_physical_edges;
+    
+    // [Dimensionality Reduction]: Drop one equality constraint per commodity to ensure full row rank.
+    int total_equality_constraints = num_commodities * (V - 1); 
+    
+    // Node index mapping accommodating the reduced constraint space
+    auto get_reduced_dual_idx = [&](int k, int node) {
+        return k * (V - 1) + node;
+    };
+
+    std::cout << "\n>>> Invoke Primal-Dual IPM solver (mu=" << config.lse_smoothing_parameter 
+              << ", alpha=" << fairness_alpha << ") <<<\n";
+
+    // =========================================================
+    // 0. Construct Sparse Incidence Matrix A and Demand Vector b
+    // =========================================================
+    SparseMatrix<double> A_incidence(total_equality_constraints, total_primal_vars);
+    std::vector<Triplet<double>> A_matrix_triplets;
+    VectorXd b_demand = VectorXd::Zero(total_equality_constraints);
+
+    for (int k = 0; k < num_commodities; ++k) {
+        int source_node = std::get<0>(commodity_demands[k]);
+        int target_node = std::get<1>(commodity_demands[k]);
+
+        // Flow conservation logic: Source = 1, Destination = -1 (Solving for flow ratios x \in [0,1])
+        // [Safety]: Only populate demand vector if the node was not dropped for row rank
+        if (source_node != V - 1) {
+            b_demand(get_reduced_dual_idx(k, source_node)) = 1.0;
+        }
+        if (target_node != V - 1) {
+            b_demand(get_reduced_dual_idx(k, target_node)) = -1.0;
+        }
+
+        for (int e = 0; e < num_physical_edges; ++e) {
+            int u = idx_map.physical_edges[e].first;
+            int v = idx_map.physical_edges[e].second;
+            int primal_idx = idx_map.get_primal_x_idx(k, e);
+
+            // [Incidence Matrix]: If the endpoint is the dropped node (V-1), discard the term (implicit grounding)
+            if (u != V - 1) {
+                A_matrix_triplets.push_back({ get_reduced_dual_idx(k, u), primal_idx, 1.0 });
+            }
+            if (v != V - 1) {
+                A_matrix_triplets.push_back({ get_reduced_dual_idx(k, v), primal_idx, -1.0 });
+            }
+        }
+    }
+    
+    A_incidence.setFromTriplets(A_matrix_triplets.begin(), A_matrix_triplets.end());
+    SparseMatrix<double> A_transposed = A_incidence.transpose();
+
+    // =========================================================
+    // 1. Extract Pristine Physical Flow Baseline
+    // =========================================================
+    double lse_mu = config.lse_smoothing_parameter; 
+    double objective_alpha_weight = fairness_alpha; 
+    
+    VectorXd x_pristine = VectorXd::Zero(total_primal_vars);
+    
+    for (int k = 0; k < num_commodities; ++k) {
+        for (const auto& pair : flow_routing_matrix[k]) {
+            int target_edge_idx = -1;
+            for (int e = 0; e < num_physical_edges; ++e) {
+                if (idx_map.physical_edges[e].first == pair.first.first && idx_map.physical_edges[e].second == pair.first.second) { 
+                    target_edge_idx = e; 
+                    break; 
+                }
+            }
+            if (target_edge_idx != -1) {
+                x_pristine(idx_map.get_primal_x_idx(k, target_edge_idx)) += pair.second;
+            }
+        }
+    }
+
+    // =========================================================
+    // 1.5 Initial Environmental Perception & Gradient Bootstrapping
+    // =========================================================
+    VectorXd primal_x = VectorXd::Zero(total_primal_vars);
+    VectorXd dual_s = VectorXd::Zero(total_primal_vars);
+    VectorXd dual_y = VectorXd::Zero(total_equality_constraints);
+
+    // Apply strict non-negativity floor to primal variables
+    for (int i = 0; i < total_primal_vars; ++i) {
+        primal_x(i) = std::max(x_pristine(i), 1e-4);
+    }
+
+    VectorXd initial_physical_gradient = VectorXd::Zero(total_primal_vars);
+    VectorXd delay_coefficient_vec = VectorXd::Zero(total_primal_vars);
+    
+    std::vector<double> expected_commodity_delays(num_commodities, 0.0);
+    double baseline_commodity_vol = std::get<2>(commodity_demands[0]);
+    
+    // Virtual capacity probe to prevent singularity over zero-flow physical edges
+    double virtual_capacity_fallback = std::max(1e-4, baseline_commodity_vol * 0.01); 
+
+    // --- Phase A: Compute Initial Delay Constants ---
+    for (int k = 0; k < num_commodities; ++k) {
+        double traffic_volume = std::get<2>(commodity_demands[k]);
+        for (int e = 0; e < num_physical_edges; ++e) {
+            Link current_link = idx_map.physical_edges[e];
+
+            double real_capacity = rate_capacities.count(current_link) ? rate_capacities.at(current_link) : 1e-9;
+            double safe_capacity = std::max(real_capacity, virtual_capacity_fallback);
+
+            double traversal_time_coefficient = traffic_volume / safe_capacity; 
+            
+            int primal_idx = idx_map.get_primal_x_idx(k, e);
+            delay_coefficient_vec(primal_idx) = traversal_time_coefficient;
+            expected_commodity_delays[k] += primal_x(primal_idx) * traversal_time_coefficient; 
+        }
+    }
+
+    // Stabilized Softmax 
+    double global_max_delay = *std::max_element(expected_commodity_delays.begin(), expected_commodity_delays.end());
+    double sum_lse_exponentials = 0.0;
+    std::vector<double> softmax_coefficients(num_commodities, 0.0);
+    
+    for (int k = 0; k < num_commodities; ++k) {
+        sum_lse_exponentials += std::exp(lse_mu * (expected_commodity_delays[k] - global_max_delay));
+    }
+    for (int k = 0; k < num_commodities; ++k) {
+        softmax_coefficients[k] = std::exp(lse_mu * (expected_commodity_delays[k] - global_max_delay)) / sum_lse_exponentials;
+    }
+
+    // --- Phase B: Compute Physical Gradients ---
+    for (int k = 0; k < num_commodities; ++k) {
+        double traffic_volume = std::get<2>(commodity_demands[k]);
+        for (int e = 0; e < num_physical_edges; ++e) {
+            int primal_idx = idx_map.get_primal_x_idx(k, e);
+            Link current_link = idx_map.physical_edges[e];
+
+            double real_capacity = rate_capacities.count(current_link) ? rate_capacities.at(current_link) : 1e-9;
+            double safe_capacity = std::max(real_capacity, virtual_capacity_fallback);
+            double allocated_power = power_allocations.count(current_link) ? std::max(power_allocations.at(current_link), 0.0) : 0.0;
+
+            double partial_grad_delay = softmax_coefficients[k] * delay_coefficient_vec(primal_idx); 
+            double partial_grad_energy = traffic_volume * (allocated_power / safe_capacity);
+
+            initial_physical_gradient(primal_idx) = objective_alpha_weight * partial_grad_delay + (1.0 - objective_alpha_weight) * partial_grad_energy;
+        }
+    }
+    
+    // =========================================================
+    // 2. Adaptive Centered Warm Start (Target-Gap Reverse Engineering)
+    // =========================================================
+
+    double max_initial_gradient_magnitude = initial_physical_gradient.lpNorm<Infinity>();
+    
+    // Dynamic Scaling: Compress extreme gradient spikes down to a healthy magnitude to stabilize the KKT system
+    double gradient_scale_factor = std::max(1.0, max_initial_gradient_magnitude / 10.0);
+
+    // 1. Scale initial gradients prior to dual variable (s) assignment
+    initial_physical_gradient /= gradient_scale_factor;
+
+    for (int i = 0; i < total_primal_vars; ++i) {
+        dual_s(i) = std::max(0.1, std::abs(initial_physical_gradient(i)));
+    }
+
+    // 2. [CRITICAL MATHEMATHICAL ALIGNMENT]: Synchronously scale the Hessian curvature coefficient (alpha_mu)
+    double scaled_curvature_coefficient = (objective_alpha_weight * lse_mu) / gradient_scale_factor;
+
+    // Doomsday Vault: Absolute state backups
+    VectorXd preserved_initial_x = primal_x;
+    VectorXd preserved_initial_y = dual_y;
+    VectorXd preserved_initial_s = dual_s;
+
+    double active_centering_parameter = config.initial_centering_parameter; 
+
+    // =========================================================
+    // Performance Critical: Pre-allocate Hessian inversion workspaces
+    // =========================================================
+    VectorXd workspace_apply_res = VectorXd::Zero(total_primal_vars);
+    VectorXd buf_v_k = VectorXd::Zero(num_physical_edges);
+    VectorXd buf_lambda_k = VectorXd::Zero(num_physical_edges);
+    VectorXd buf_u_k = VectorXd::Zero(num_physical_edges);
+    VectorXd buf_hat_v_k = VectorXd::Zero(num_physical_edges);
+    VectorXd buf_hat_u_k = VectorXd::Zero(num_physical_edges);
+
+    double best_observed_duality_gap = 1e9;
+    VectorXd optimal_x = primal_x;
+    VectorXd optimal_y = dual_y; 
+    VectorXd optimal_s = dual_s; 
+
+    double previous_duality_gap = 1e9;
+    int consecutive_stall_count = 0;
+    int primal_step_starvation_count = 0;
+    double primal_step_size = 1.0;
+    double dual_step_size = 1.0;
+
+    // =========================================================
+    // 3. Newton's Method Core Iteration
+    // =========================================================
+
+    for (int iter = 0; iter < config.max_iterations; ++iter) {
+  
+        // =========================================================
+        // 2.1 Compute Duality Gap and Barrier Parameter (\tau)
+        // =========================================================
+        double duality_gap = (primal_x.dot(dual_s)) / total_primal_vars; 
+  
+        // [Strict Safety Assertion]: Interior Point boundaries
+        if (primal_x.minCoeff() <= 0.0 || dual_s.minCoeff() <= 0.0) {
+            std::cerr << "[Fatal Error] Primal (x) or Dual (s) variables breached the strict positive boundary. Line search corrupted.\n";
+        }
+        double barrier_parameter_tau = active_centering_parameter * duality_gap;
+  
+        // =========================================================
+        // 2.2 Physical Gradient Evaluation and Delay Vector Assembly
+        // =========================================================
+        VectorXd objective_gradient = VectorXd::Zero(total_primal_vars);
+        
+        // Loop 1: Compute baseline delay costs and aggregate expected delays
+        std::fill(expected_commodity_delays.begin(), expected_commodity_delays.end(), 0.0);
+  
+        for (int k = 0; k < num_commodities; ++k) {
+            double traffic_volume = std::get<2>(commodity_demands[k]);
+            for (int e = 0; e < num_physical_edges; ++e) {
+                Link current_link = idx_map.physical_edges[e];
+  
+                double real_capacity = rate_capacities.count(current_link) ? rate_capacities.at(current_link) : 1e-9;
+                double safe_capacity = std::max(real_capacity, virtual_capacity_fallback);
+  
+                double traversal_time_coefficient = traffic_volume / safe_capacity; 
+                int primal_idx = idx_map.get_primal_x_idx(k, e);
+                
+                delay_coefficient_vec(primal_idx) = traversal_time_coefficient;
+                expected_commodity_delays[k] += primal_x(primal_idx) * traversal_time_coefficient; 
+            }
+        }
+  
+        // Stabilized Softmax computation (\beta_k)
+        global_max_delay = *std::max_element(expected_commodity_delays.begin(), expected_commodity_delays.end());
+        sum_lse_exponentials = 0.0;
+        
+        for (int k = 0; k < num_commodities; ++k) {
+            sum_lse_exponentials += std::exp(lse_mu * (expected_commodity_delays[k] - global_max_delay));
+        }
+        for (int k = 0; k < num_commodities; ++k) {
+            softmax_coefficients[k] = std::exp(lse_mu * (expected_commodity_delays[k] - global_max_delay)) / sum_lse_exponentials;
+        }
+  
+        // Loop 2: Assemble the scaled objective gradient and rank-1 Hessian update terms
+        VectorXd hessian_rank1_update_vector = VectorXd::Zero(total_primal_vars);
+        
+        for (int k = 0; k < num_commodities; ++k) {
+            double traffic_volume = std::get<2>(commodity_demands[k]);
+            for (int e = 0; e < num_physical_edges; ++e) {
+                int primal_idx = idx_map.get_primal_x_idx(k, e);
+                Link current_link = idx_map.physical_edges[e];
+                
+                double allocated_power = power_allocations.count(current_link) ? power_allocations.at(current_link) : 0.0;
+  
+                if (std::isnan(allocated_power) || std::isinf(allocated_power) || allocated_power < 0.0) {
+                    allocated_power = 0.0;
+                }
+  
+                double current_delay_coeff = delay_coefficient_vec(primal_idx);
+  
+                double partial_grad_delay = softmax_coefficients[k] * current_delay_coeff;
+                double partial_grad_energy = allocated_power * current_delay_coeff;
+  
+                // Composite gradient fusing delay (alpha) and energy (1 - alpha)
+                double raw_gradient = objective_alpha_weight * partial_grad_delay + (1.0 - objective_alpha_weight) * partial_grad_energy;
+                objective_gradient(primal_idx) = raw_gradient / gradient_scale_factor;
+  
+                // Construction of global vector u for Rank-1 Sherman-Morrison update
+                hessian_rank1_update_vector(primal_idx) = std::sqrt(scaled_curvature_coefficient) * softmax_coefficients[k] * current_delay_coeff;
+            }
+        }
+  
+        // =========================================================
+        // 2.3 KKT Residual Computations
+        // =========================================================
+        VectorXd primal_residual = A_incidence * primal_x - b_demand;
+        VectorXd dual_residual = -objective_gradient + A_transposed * dual_y + dual_s;
+        VectorXd centrality_residual = primal_x.cwiseProduct(dual_s) - VectorXd::Constant(total_primal_vars, barrier_parameter_tau);
+  
+        double primal_infeasibility = primal_residual.lpNorm<Infinity>();
+        double dual_infeasibility = dual_residual.lpNorm<Infinity>();
+        double gradient_infinity_norm = objective_gradient.lpNorm<Infinity>();
+        double relative_dual_infeasibility = dual_infeasibility / (1.0 + gradient_infinity_norm);
+  
+        // Preserve optimal physical snapshot enforcing flow conservation
+        if (duality_gap < best_observed_duality_gap && primal_infeasibility < 1e-3) {
+            best_observed_duality_gap = duality_gap;
+            optimal_x = primal_x;
+            optimal_y = dual_y;
+            optimal_s = dual_s;
+        }
+  
+        // =========================================================
+        // 2.4 Hierarchical Stopping Criteria
+        // =========================================================
+        
+        // Level 1: Perfect KKT Convergence
+        double max_kkt_residual = std::max({ primal_infeasibility, relative_dual_infeasibility, duality_gap });
+        if (max_kkt_residual < config.convergence_tolerance) { 
+            std::cout << ">>> Satisfying strict KKT conditions (Iter " << iter << ") <<<\n";
+            break;
+        }
+  
+        // Level 2: Target Engineering Precision (Early Stop)
+        if (duality_gap < 1e-5 && primal_infeasibility < 1e-5 && relative_dual_infeasibility < 7e-2) { 
+            std::cout << ">>> Target engineering precision reached. Stopping in advance. <<<\n";
+            break;
+        }
+  
+        // Level 3: Numerical Stalling Detection (Absolute/Relative Hybrid)
+        double absolute_gap_change = std::abs(previous_duality_gap - duality_gap);
+        bool is_numerically_stalling = (absolute_gap_change / (previous_duality_gap + 1e-9) < 1e-4) && (primal_infeasibility < 1e-3);
+  
+        if (iter < 10) {
+            is_numerically_stalling = false; // Immunity during initial Centering Phase
+        }
+  
+        consecutive_stall_count = is_numerically_stalling ? consecutive_stall_count + 1 : 0;
+        if (consecutive_stall_count >= 3) {
+            if (duality_gap < 1e-4) {
+                std::cout << ">>> Numerical stalling at deep optimum. Exiting with success.\n";
+            } else {
+                std::cout << ">>> Numerical stalling detected. Restoring optimal snapshot.\n";
+                primal_x = optimal_x; 
+                dual_y = optimal_y; 
+                dual_s = optimal_s; 
+            }
+            break;
+        }
+        previous_duality_gap = duality_gap;
+  
+        // Level 4: Step-Size Starvation Cutoff (Black Hole Defense)
+        bool is_step_starving = (primal_step_size < 5e-3) && (dual_step_size < 5e-3);
+        primal_step_starvation_count = is_step_starving ? primal_step_starvation_count + 1 : 0;
+  
+        if (iter >= 5 && primal_step_starvation_count >= 3) {
+            if (duality_gap < 1e-4 || primal_infeasibility < 0.1) {
+                std::cout << ">>> Step-size starvation (Black hole). Restoring optimal snapshot.\n";
+                primal_x = optimal_x; 
+                dual_y = optimal_y; 
+                dual_s = optimal_s;
+            } else {
+                std::cout << ">>> Severe numerical crash. Fallback to absolute initial state.\n";
+                primal_x = preserved_initial_x; 
+                dual_y = preserved_initial_y; 
+                dual_s = preserved_initial_s;
+            }
+            break;
+        }
+  
+        // Fallback Mechanism: Max iteration bound
+        if (iter == config.max_iterations - 1) {
+            if (primal_infeasibility > 1e-3 || duality_gap > best_observed_duality_gap * 5.0) {
+                std::cout << ">>> Max iterations reached with divergent tail. Restoring optimal snapshot.\n";
+                primal_x = optimal_x; 
+                dual_y = optimal_y; 
+                dual_s = optimal_s;
+            }
+        }
+  
+        // =========================================================
+        // 2.5 Block-Diagonal Hessian Inversion (Sherman-Morrison Formula)
+        // =========================================================
+        /**
+         * @note Computes D^{-1} * vec efficiently without allocating heap memory.
+         * Exploits the block-diagonal structure where each block corresponds to a commodity k.
+         * Each block is a diagonal matrix plus a rank-1 update: W_k = \Lambda_k + u_k u_k^T.
+         * Utilizes the Sherman-Morrison formula: (A + uv^T)^{-1} = A^{-1} - (A^{-1}uv^T A^{-1}) / (1 + v^T A^{-1} u)
+         * Time Complexity: O(K * E) pure vector operations. Zero dynamic memory allocation via .noalias().
+         */
+        auto apply_inverse_hessian_block = [&](const VectorXd& target_vec) -> const VectorXd& {
+            for (int k = 0; k < num_commodities; ++k) {
+                int start_idx = k * num_physical_edges;
+  
+                // Direct memory overwrite preventing temporary variable instantiation
+                buf_v_k.noalias() = target_vec.segment(start_idx, num_physical_edges);
+                
+                // Diagonal matrix \Lambda = X^{-1}S (Barrier curvature)
+                buf_lambda_k.noalias() = dual_s.segment(start_idx, num_physical_edges)
+                                        .cwiseQuotient(primal_x.segment(start_idx, num_physical_edges));
+                buf_lambda_k = buf_lambda_k.cwiseMax(1e-8).cwiseMin(1e8);
+  
+                // Rank-1 update u_k (Non-linear LSE curvature)
+                double sqrt_curvature_term = std::sqrt(scaled_curvature_coefficient * softmax_coefficients[k]);
+                buf_u_k.noalias() = sqrt_curvature_term * delay_coefficient_vec.segment(start_idx, num_physical_edges);
+  
+                // Pre-compute A^{-1} terms
+                buf_hat_v_k.noalias() = buf_v_k.cwiseQuotient(buf_lambda_k); 
+                buf_hat_u_k.noalias() = buf_u_k.cwiseQuotient(buf_lambda_k);
+  
+                double sm_denominator_rho = 1.0 / (1.0 + buf_u_k.dot(buf_hat_u_k));
+  
+                // Write directly into the pre-allocated workspace
+                workspace_apply_res.segment(start_idx, num_physical_edges).noalias() = 
+                    buf_hat_v_k - sm_denominator_rho * (buf_u_k.dot(buf_hat_v_k)) * buf_hat_u_k;
+            }
+            return workspace_apply_res;
+        };
+
+          // =========================================================
+          // 3. Block-Decoupled Direction Solver (Newton Step)
+          // Incorporates Localized Sherman-Morrison to bypass LDLT singularity
+          // =========================================================
+          
+          VectorXd kkt_direction_hat_v = apply_inverse_hessian_block(hessian_rank1_update_vector);
+          double v_transpose_hat_v = hessian_rank1_update_vector.dot(kkt_direction_hat_v);
+          
+          // Dynamic Damping: Supress curvature inversion if the Newton step exceeds the trust region
+          double curvature_damping = 1e-6; 
+          if (v_transpose_hat_v >= 1.0) {
+              curvature_damping = 1e-2; 
+          }
+          double global_rho_modifier = 1.0 / (std::max(1.0 - v_transpose_hat_v, curvature_damping));
+
+          VectorXd dual_z_vector = A_incidence * kkt_direction_hat_v;
+          
+          VectorXd X_inv_rc_term = centrality_residual.cwiseQuotient(primal_x);
+          VectorXd rd_minus_Xinv_rc = dual_residual - X_inv_rc_term;
+          VectorXd D_inv_rd_term = apply_inverse_hessian_block(rd_minus_Xinv_rc);
+
+          // Synthesize the fully coupled global RHS vector (g)
+          VectorXd global_g_vector = -primal_residual - A_incidence * D_inv_rd_term - 
+                                     global_rho_modifier * dual_z_vector * (kkt_direction_hat_v.dot(rd_minus_Xinv_rc));
+
+          VectorXd decoupled_hat_z = VectorXd::Zero(total_equality_constraints);
+          VectorXd decoupled_hat_g = VectorXd::Zero(total_equality_constraints); 
+
+          // ---------------------------------------------------------
+          // Decoupled Block Solution (Looping over independent commodities)
+          // ---------------------------------------------------------
+          for (int k = 0; k < num_commodities; ++k) {
+              int primal_offset = k * num_physical_edges;
+              int dual_offset = k * (V - 1);
+
+              // A) Extract local variables and construct the pure Laplacian Matrix (L_k)
+              VectorXd block_lambda = dual_s.segment(primal_offset, num_physical_edges)
+                                            .cwiseQuotient(primal_x.segment(primal_offset, num_physical_edges));
+              block_lambda = block_lambda.cwiseMax(1e-8).cwiseMin(1e8);
+
+              VectorXd block_u = std::sqrt(scaled_curvature_coefficient * softmax_coefficients[k]) * delay_coefficient_vec.segment(primal_offset, num_physical_edges);
+              VectorXd block_hat_u = block_u.cwiseQuotient(block_lambda);
+              double block_rho = 1.0 / (1.0 + block_u.dot(block_hat_u));
+
+              MatrixXd laplacian_k = MatrixXd::Zero(V - 1, V - 1);  
+              for (int e = 0; e < num_physical_edges; ++e) {
+                  int u_node = idx_map.physical_edges[e].first;
+                  int v_node = idx_map.physical_edges[e].second;
+                  double edge_weight = 1.0 / block_lambda(e);
+
+                  if (u_node != V - 1) laplacian_k(u_node, u_node) += edge_weight;
+                  if (v_node != V - 1) laplacian_k(v_node, v_node) += edge_weight;
+                  if (u_node != V - 1 && v_node != V - 1) {
+                      laplacian_k(u_node, v_node) -= edge_weight;
+                      laplacian_k(v_node, u_node) -= edge_weight;
+                  }
+              }
+
+              // Compute local rank-1 modifier z_block_k = A_k * hat_u_k
+              VectorXd z_block_modifier = VectorXd::Zero(V - 1);
+              for (int e = 0; e < num_physical_edges; ++e) {
+                  int u_node = idx_map.physical_edges[e].first;
+                  int v_node = idx_map.physical_edges[e].second;
+                  if (u_node != V - 1) z_block_modifier(u_node) += block_hat_u(e);
+                  if (v_node != V - 1) z_block_modifier(v_node) -= block_hat_u(e);
+              }
+
+              // B) Extreme Performance LDLT Decomposition on the Pure Laplacian
+              MatrixXd regularized_laplacian = laplacian_k;
+              regularized_laplacian.diagonal().array() += 1e-11; 
+              Eigen::LDLT<MatrixXd> ldlt_solver(regularized_laplacian);
+              
+              if (ldlt_solver.info() != Eigen::Success) {
+                  regularized_laplacian = laplacian_k; 
+                  regularized_laplacian.diagonal().array() += 1e-8; // Heavier regularization fallback
+                  ldlt_solver.compute(regularized_laplacian);
+              }
+
+              // C) Localized Sherman-Morrison Fusion 
+              // Solves the true dense system: (L_k - \rho_k * z_k * z_k^T) y = RHS
+              VectorXd rhs_g_local = global_g_vector.segment(dual_offset, V - 1);
+              VectorXd rhs_z_global_local = dual_z_vector.segment(dual_offset, V - 1); 
+
+              VectorXd temp_hat_g = ldlt_solver.solve(rhs_g_local);
+              VectorXd temp_hat_z = ldlt_solver.solve(rhs_z_global_local);
+              VectorXd sm_v_block = ldlt_solver.solve(z_block_modifier);
+
+              double raw_dot_product = z_block_modifier.dot(sm_v_block);
+              
+              // Singularity Blockade: Absolute algebraic safety net
+              double sm_denominator = std::max(1e-8, 1.0 - block_rho * raw_dot_product);
+              
+              VectorXd true_hat_g = temp_hat_g + (block_rho / sm_denominator) * (z_block_modifier.dot(temp_hat_g)) * sm_v_block;
+              VectorXd true_hat_z = temp_hat_z + (block_rho / sm_denominator) * (z_block_modifier.dot(temp_hat_z)) * sm_v_block;
+
+              decoupled_hat_g.segment(dual_offset, V - 1) = true_hat_g;
+              decoupled_hat_z.segment(dual_offset, V - 1) = true_hat_z;
+          }
+
+          // ---------------------------------------------------------
+          // 4. Global Sherman-Morrison Restoration
+          // Re-couples the isolated blocks using the global modifier (\rho)
+          // ---------------------------------------------------------
+          double z_dot_hat_z = dual_z_vector.dot(decoupled_hat_z);
+          double global_sm_gamma = global_rho_modifier / (1.0 + global_rho_modifier * z_dot_hat_z);
+          double z_dot_hat_g = dual_z_vector.dot(decoupled_hat_g);
+
+          VectorXd delta_y = decoupled_hat_g - global_sm_gamma * z_dot_hat_g * decoupled_hat_z;
+
+          // Variable back-substitution to extract \Delta x and \Delta s
+          VectorXd u_vector = A_transposed * delta_y + rd_minus_Xinv_rc;
+          VectorXd D_inv_u_vector = apply_inverse_hessian_block(u_vector);
+          VectorXd delta_x = D_inv_u_vector + global_rho_modifier * (kkt_direction_hat_v.dot(u_vector)) * kkt_direction_hat_v;
+
+          VectorXd delta_s = -X_inv_rc_term - (dual_s.cwiseQuotient(primal_x)).cwiseProduct(delta_x);
+
+          // =========================================================
+          // 5. Fraction-to-the-Boundary Line Search
+          // =========================================================
+          double max_allowable_alpha_primal = 1.0; 
+          double max_allowable_alpha_dual = 1.0; 
+
+          for (int i = 0; i < total_primal_vars; ++i) {
+              if (delta_x(i) < 0) max_allowable_alpha_primal = std::min(max_allowable_alpha_primal, -primal_x(i) / delta_x(i));
+              if (delta_s(i) < 0) max_allowable_alpha_dual = std::min(max_allowable_alpha_dual, -dual_s(i) / delta_s(i));
+          }
+
+          // Standard 0.99 damping to prevent hitting the strict boundary
+          primal_step_size = std::min(1.0, 0.99 * max_allowable_alpha_primal);
+          dual_step_size = std::min(1.0, 0.99 * max_allowable_alpha_dual);
+
+          // =========================================================
+          // 6. State Updates & Dynamic Centering (\sigma)
+          // =========================================================
+          primal_x += primal_step_size * delta_x;
+          dual_y += dual_step_size * delta_y;
+          dual_s += dual_step_size * delta_s;
+
+          if (config.enable_dynamic_centering) {
+              double min_step = std::min(primal_step_size, dual_step_size);
+              double step_progression = 1.0 - min_step;
+              active_centering_parameter = std::max(1e-3, std::min(0.95, step_progression * step_progression));
+          }
+      } // End Main Newton Iteration Loop
+
+      // =========================================================
+      // Core Upgrade: Max-Bottleneck Fractional Path Extraction
+      // Cleanses IPM numerical artifacts and resolves cycle/congestion anomalies.
+      // =========================================================
+      flow_routing_matrix.clear();
+      flow_routing_matrix.resize(num_commodities);
+
+      std::cout << ">>> Executing Max-Bottleneck Fractional Path Extraction <<<\n";
+
+      for (int k = 0; k < num_commodities; ++k) {
+          int source_node = static_cast<int>(std::get<0>(commodity_demands[k]));
+          int target_node = static_cast<int>(std::get<1>(commodity_demands[k]));
+
+          std::map<Link, double> raw_flow_fractions;
+
+          // 1. Threshold Filtering: Eliminating algebraic dust
+          for (int e = 0; e < num_physical_edges; ++e) {
+              double routing_fraction = primal_x(idx_map.get_primal_x_idx(k, e));
+              if (routing_fraction > 1e-4) {
+                  raw_flow_fractions[idx_map.physical_edges[e]] = routing_fraction;
+              }
+          }
+
+          // 2. Physical Ping-Pong Cycle Cancellation
+          for (auto& pair : raw_flow_fractions) {
+              int u = pair.first.first; 
+              int v = pair.first.second;
+              
+              if (u < v && raw_flow_fractions.count({ v, u })) {
+                  double f_forward = pair.second; 
+                  double f_reverse = raw_flow_fractions[{v, u}];
+                  
+                  if (f_forward > f_reverse) { 
+                      pair.second = f_forward - f_reverse; 
+                      raw_flow_fractions[{v, u}] = 0.0; 
+                  } else { 
+                      raw_flow_fractions[{v, u}] = f_reverse - f_forward; 
+                      pair.second = 0.0; 
+                  }
+              }
+          }
+
+          // 3. Reconstruct active topology
+          std::vector<std::vector<int>> active_adjacency(num_nodes);
+          for (const auto& pair : raw_flow_fractions) {
+              if (pair.second > 1e-8) {
+                  active_adjacency[pair.first.first].push_back(pair.first.second);
+              }
+          }
+
+          struct ExtractedPath {
+              std::vector<Link> edges;
+              double volume;
+          };
+          std::vector<ExtractedPath> all_extracted_paths;
+          double total_extracted_volume = 0.0;
+
+          // 4. Max-Bottleneck Subgraph Peeling
+          while (true) {
+              std::vector<double> bottleneck_capacities(num_nodes, -1.0);
+              std::vector<int> traversal_parents(num_nodes, -1);
+
+              std::priority_queue<std::pair<double, int>> bottleneck_pq;
+
+              bottleneck_capacities[source_node] = 1e9; 
+              bottleneck_pq.push({ 1e9, source_node });
+
+              bool path_found = false;
+              
+              while (!bottleneck_pq.empty()) {
+                  double current_flow_limit = bottleneck_pq.top().first;
+                  int u = bottleneck_pq.top().second;
+                  bottleneck_pq.pop();
+
+                  if (current_flow_limit < bottleneck_capacities[u]) continue; 
+                  if (u == target_node) { 
+                      path_found = true; 
+                      break; 
+                  }
+
+                  for (int v : active_adjacency[u]) {
+                      Link current_link = { u, v };
+                      double edge_residual_flow = raw_flow_fractions.count(current_link) ? raw_flow_fractions[current_link] : 0.0;
+                      
+                      if (edge_residual_flow > 1e-8) {
+                          double path_bottleneck = std::min(current_flow_limit, edge_residual_flow);
+                          if (path_bottleneck > bottleneck_capacities[v]) {
+                              bottleneck_capacities[v] = path_bottleneck;
+                              traversal_parents[v] = u;
+                              bottleneck_pq.push({ path_bottleneck, v });
+                          }
+                      }
+                  }
+              }
+
+              if (!path_found) break; 
+
+              int current_vertex = target_node;
+              std::vector<Link> extracted_route;
+              double extracted_bottleneck_flow = bottleneck_capacities[target_node]; 
+
+              if (extracted_bottleneck_flow < 1e-8) break; 
+
+              while (current_vertex != source_node) {
+                  int previous_vertex = traversal_parents[current_vertex];
+                  Link current_link = { previous_vertex, current_vertex };
+                  extracted_route.push_back(current_link);
+                  current_vertex = previous_vertex;
+              }
+
+              for (const auto& lk : extracted_route) {
+                  raw_flow_fractions[lk] -= extracted_bottleneck_flow;
+              }
+
+              all_extracted_paths.push_back({ extracted_route, extracted_bottleneck_flow });
+              total_extracted_volume += extracted_bottleneck_flow;
+          }
+
+          // 5. Hard Fallback (Topology Fragmentation Protection)
+          if (total_extracted_volume < 0.5) {
+              std::cout << "  [Fallback] Commodity " << k << " extraction collapsed (" << total_extracted_volume
+                        << "). Triggering Bandwidth-Aware Single-Path Recovery.\n";
+
+              std::map<Link, double> fallback_weights;
+              for (const auto& pair : rate_capacities) {
+                  fallback_weights[pair.first] = 1.0 / (pair.second + 1e-6);
+              }
+
+              auto [sp_nodes, path_len] = dijkstra(graph, source_node, target_node, fallback_weights); 
+
+              if (sp_nodes.size() > 1) {
+                  for (std::size_t i = 0; i < sp_nodes.size() - 1; ++i) {
+                      Link current_link = { static_cast<int>(sp_nodes[i]), static_cast<int>(sp_nodes[i + 1]) };
+                      flow_routing_matrix[k][current_link] = 1.0; 
+                  }
+              }
+              continue; 
+          }
+
+          // 6. Proportional Truncation and Re-normalization
+          std::sort(all_extracted_paths.begin(), all_extracted_paths.end(),
+              [](const ExtractedPath& a, const ExtractedPath& b) { 
+                  return a.volume > b.volume; 
+              });
+
+          double retained_volume = 0.0;
+          int retained_path_count = 0;
+          std::map<Link, double> sanitized_flow_matrix;
+          
+          const int kMaxRetainedPaths = 5;
+          const double kTruncationThresholdRatio = 0.01;
+
+          for (std::size_t i = 0; i < all_extracted_paths.size(); ++i) {
+              const auto& path = all_extracted_paths[i];
+              double proportional_ratio = path.volume / total_extracted_volume;
+
+              if ((proportional_ratio > kTruncationThresholdRatio && retained_path_count < kMaxRetainedPaths) || i == 0) {
+                  retained_volume += path.volume;
+                  retained_path_count++;
+                  for (const auto& lk : path.edges) {
+                      sanitized_flow_matrix[lk] += path.volume;
+                  }
+              } else {
+                  break;
+              }
+          }
+
+          if (retained_volume > 0.0) {
+              double normalization_scale = 1.0 / retained_volume;
+              for (const auto& pair : sanitized_flow_matrix) {
+                  flow_routing_matrix[k][pair.first] = pair.second * normalization_scale;
+              }
+          }
+      }
+}
