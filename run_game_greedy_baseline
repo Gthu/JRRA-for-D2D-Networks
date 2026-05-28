@@ -1,0 +1,265 @@
+#include <vector>
+#include <map>
+#include <tuple>
+#include <cmath>
+#include <queue>
+#include <algorithm>
+#include <numeric>
+#include <random>
+#include <iostream>
+#include "solver_dual.h" // Ensure your struct definition is included here
+
+/**
+ * @brief Executes the Game-Greedy Baseline (GGB) algorithm for joint routing and resource allocation.
+ * @param edge_list List of network edges defined as tuples (source, destination, distance_in_meters).
+ * @param num_nodes Total number of nodes in the network topology.
+ * @param P_max_nodes Maximum physical transmission power constraint (P_max) for each node.
+ * @param B_total_MHz Total available system bandwidth in MHz.
+ * @param pd_data Traffic flow demands defined as tuples (source, destination, required_traffic_volume).
+ * @param N0_dBm_per_MHz Background noise power spectral density in dBm/MHz.
+ * @return OptimizationResult Struct containing the aligned output payload for bandwidth, power, rates, 
+ * times, routing matrices, and evaluated delay/energy metrics.
+ * @note 
+ * Algorithm Complexity & Mathematical Steps:
+ * 1. Topology & State Initialization: Parses network edges, calculates physical path loss, and initializes 
+ * transmission power bounds adhering strictly to hardware limits uniformly across outgoing links.
+ * 2. Demand Sorting: Applies a greedy heuristic by sorting traffic demands in descending order of volume.
+ * 3. Joint Routing (Greedy): Iteratively routes flows using Dijkstra's algorithm to find the minimum marginal 
+ * cost path based on the current load-to-capacity ratio.
+ * 4. Iterative Potential Game (Resource Allocation): Following each routing update, active nodes unilaterally 
+ * adjust their transmit power distributions across outgoing links to minimize the global potential function 
+ * (expected network delay). Bounded strictly by iterations until Nash Equilibrium is approximated.
+ * 5. Bandwidth Reallocation: System bandwidth is proportionally reallocated based on updated physical traffic loads.
+ */
+OptimizationResult run_game_greedy_baseline(
+  const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
+  int num_nodes,
+  const std::vector<double>& P_max_nodes,
+  double B_total_MHz,
+  const std::vector<std::tuple<size_t, size_t, double>>& pd_data,
+  double N0_dBm_per_MHz
+) {
+  OptimizationResult optimization_metrics;
+  const int num_edges = edge_list.size();
+  const int num_flows = pd_data.size();
+  
+  const double noise_power_watts_per_mhz = std::pow(10.0, (N0_dBm_per_MHz - 30.0) / 10.0);
+  constexpr double kEpsilon = 1e-9;
+  constexpr double kMaxDelayPenalty = 1e8;
+
+  // 1. Graph topology construction and channel gain pre-calculation
+  std::vector<std::vector<std::pair<int, int>>> adjacency_list(num_nodes);
+  std::vector<double> link_channel_gains(num_edges);
+  std::vector<int> node_out_degrees(num_nodes, 0);
+
+  for (int e = 0; e < num_edges; ++e) {
+    int u = static_cast<int>(std::get<0>(edge_list[e]));
+    int v = static_cast<int>(std::get<1>(edge_list[e]));
+    adjacency_list[u].push_back({v, e});
+    node_out_degrees[u]++;
+
+    double distance_meters = std::get<2>(edge_list[e]);
+    double distance_km = std::max(0.001, distance_meters / 1000.0);
+    double path_loss_db = 128.1 + 37.6 * std::log10(distance_km);
+    link_channel_gains[e] = std::pow(10.0, -path_loss_db / 10.0);
+  }
+
+  // 2. Global state initialization
+  std::vector<double> link_traffic_loads(num_edges, 0.0);
+  std::vector<double> link_tx_powers(num_edges, 0.0);
+  std::vector<double> link_allocated_bandwidths(num_edges, B_total_MHz / num_edges);
+  std::vector<std::map<Link, double>> flow_routing_paths(num_flows);
+
+  for (int e = 0; e < num_edges; ++e) {
+    int u = static_cast<int>(std::get<0>(edge_list[e]));
+    link_tx_powers[e] = P_max_nodes[u] / std::max(1, node_out_degrees[u]);
+  }
+
+  // 3. Traffic demand sorting (Greedy heuristic logic)
+  std::vector<int> flow_processing_order(num_flows);
+  std::iota(flow_processing_order.begin(), flow_processing_order.end(), 0);
+  std::sort(flow_processing_order.begin(), flow_processing_order.end(), [&](int a, int b) {
+    return std::get<2>(pd_data[a]) > std::get<2>(pd_data[b]);
+  });
+
+  auto evaluate_expected_network_delay = [&]() -> double {
+    double cumulative_delay = 0.0;
+    for (int e = 0; e < num_edges; ++e) {
+      if (link_traffic_loads[e] > kEpsilon) {
+        double signal_to_noise = (link_tx_powers[e] * link_channel_gains[e]) / 
+                                 (noise_power_watts_per_mhz * std::max(link_allocated_bandwidths[e], kEpsilon));
+        double link_capacity = std::max(link_allocated_bandwidths[e] * std::log2(1.0 + signal_to_noise), kEpsilon);
+        cumulative_delay += link_traffic_loads[e] / link_capacity;
+      }
+    }
+    return cumulative_delay;
+  };
+
+  std::mt19937 random_generator(42); 
+  std::uniform_real_distribution<double> perturbation_ratio(0.05, 0.3);
+
+  auto execute_iterative_potential_game = [&]() {
+    double current_potential_objective = evaluate_expected_network_delay();
+    constexpr int kMaxGameIterations = 50;
+
+    for (int iter = 0; iter < kMaxGameIterations; ++iter) {
+      bool is_globally_improved = false;
+
+      for (int u = 0; u < num_nodes; ++u) {
+        std::vector<int> active_edges;
+        for (const auto& edge : adjacency_list[u]) {
+          if (link_traffic_loads[edge.second] > kEpsilon) {
+            active_edges.push_back(edge.second);
+          }
+        }
+
+        if (active_edges.size() >= 2) {
+          int e1 = active_edges[random_generator() % active_edges.size()];
+          int e2 = active_edges[random_generator() % active_edges.size()];
+          if (e1 == e2) continue;
+
+          double power_delta = link_tx_powers[e1] * perturbation_ratio(random_generator);
+          link_tx_powers[e1] -= power_delta;
+          link_tx_powers[e2] += power_delta;
+
+          double new_potential_objective = evaluate_expected_network_delay();
+          if (new_potential_objective < current_potential_objective - 1e-5) {
+            current_potential_objective = new_potential_objective; 
+            is_globally_improved = true;
+          } else {
+            link_tx_powers[e1] += power_delta;
+            link_tx_powers[e2] -= power_delta;
+          }
+        }
+      }
+      if (!is_globally_improved) break;
+    }
+  };
+
+  // 4. Sequential flow routing and joint resource allocation
+  for (int flow_idx : flow_processing_order) {
+    int source_node = static_cast<int>(std::get<0>(pd_data[flow_idx]));
+    int target_node = static_cast<int>(std::get<1>(pd_data[flow_idx]));
+    double flow_demand = std::get<2>(pd_data[flow_idx]);
+
+    std::vector<double> shortest_path_costs(num_nodes, std::numeric_limits<double>::max());
+    std::vector<int> path_parent_node(num_nodes, -1);
+    std::vector<int> path_parent_edge(num_nodes, -1);
+    std::priority_queue<std::pair<double, int>, std::vector<std::pair<double, int>>, std::greater<>> min_cost_queue;
+
+    shortest_path_costs[source_node] = 0.0;
+    min_cost_queue.push({0.0, source_node});
+
+    while (!min_cost_queue.empty()) {
+      auto [current_cost, u] = min_cost_queue.top();
+      min_cost_queue.pop();
+
+      if (current_cost > shortest_path_costs[u]) continue;
+      if (u == target_node) break;
+
+      for (const auto& edge : adjacency_list[u]) {
+        int v = edge.first;
+        int e_idx = edge.second;
+
+        double signal_to_noise = (link_tx_powers[e_idx] * link_channel_gains[e_idx]) / 
+                                 (noise_power_watts_per_mhz * std::max(link_allocated_bandwidths[e_idx], kEpsilon));
+        double link_capacity = std::max(link_allocated_bandwidths[e_idx] * std::log2(1.0 + signal_to_noise), kEpsilon);
+        double marginal_edge_weight = (link_traffic_loads[e_idx] + flow_demand) / link_capacity;
+
+        if (shortest_path_costs[u] + marginal_edge_weight < shortest_path_costs[v]) {
+          shortest_path_costs[v] = shortest_path_costs[u] + marginal_edge_weight;
+          path_parent_node[v] = u;
+          path_parent_edge[v] = e_idx;
+          min_cost_queue.push({shortest_path_costs[v], v});
+        }
+      }
+    }
+
+    if (shortest_path_costs[target_node] < std::numeric_limits<double>::max() / 2.0) {
+      int current_tracer = target_node;
+      while (current_tracer != source_node) {
+        int u = path_parent_node[current_tracer];
+        int e_idx = path_parent_edge[current_tracer];
+        Link link_trace = {u, current_tracer};
+
+        flow_routing_paths[flow_idx][link_trace] = 1.0; 
+        link_traffic_loads[e_idx] += flow_demand;
+        current_tracer = u;
+      }
+    }
+
+    double total_active_traffic = std::accumulate(link_traffic_loads.begin(), link_traffic_loads.end(), 0.0);
+    if (total_active_traffic > kEpsilon) {
+      for (int e = 0; e < num_edges; ++e) {
+        link_allocated_bandwidths[e] = B_total_MHz * (link_traffic_loads[e] / total_active_traffic);
+      }
+    }
+
+    execute_iterative_potential_game();
+  }
+
+  // 5. Final performance metrics and dual-track delay calculation
+  std::vector<double> link_achieved_rates(num_edges, 0.0);
+  std::vector<double> link_transmission_times(num_edges, 0.0);
+  double total_energy_consumption = 0.0;
+
+  for (int e = 0; e < num_edges; ++e) {
+    if (link_traffic_loads[e] > kEpsilon) {
+      double signal_to_noise = (link_tx_powers[e] * link_channel_gains[e]) / 
+                               (noise_power_watts_per_mhz * std::max(link_allocated_bandwidths[e], kEpsilon));
+      link_achieved_rates[e] = link_allocated_bandwidths[e] * std::log2(1.0 + signal_to_noise);
+
+      double active_transmission_time = link_traffic_loads[e] / std::max(link_achieved_rates[e], kEpsilon);
+      link_transmission_times[e] = active_transmission_time;
+      total_energy_consumption += link_tx_powers[e] * active_transmission_time;
+    }
+  }
+
+  double calculated_max_delay = 0.0;
+  double calculated_max_sum_delay = 0.0;
+  std::vector<double> current_flow_max_path_delays(num_flows, kMaxDelayPenalty);
+  std::vector<double> current_flow_sum_delays(num_flows, kMaxDelayPenalty);
+
+  for (int k = 0; k < num_flows; ++k) {
+    double flow_demand = std::get<2>(pd_data[k]);
+    double expected_transmission_delay = 0.0;
+    bool has_valid_flow = false;
+
+    for (int e = 0; e < num_edges; ++e) {
+      int u = static_cast<int>(std::get<0>(edge_list[e]));
+      int v = static_cast<int>(std::get<1>(edge_list[e]));
+      Link link_trace = {u, v};
+
+      auto it = flow_routing_paths[k].find(link_trace);
+      if (it != flow_routing_paths[k].end() && it->second > 0.005) {
+        double physical_link_delay = flow_demand / std::max(link_achieved_rates[e], kEpsilon);
+        expected_transmission_delay += physical_link_delay;
+        has_valid_flow = true;
+      }
+    }
+
+    if (has_valid_flow) {
+      calculated_max_sum_delay = std::max(calculated_max_sum_delay, expected_transmission_delay);
+      current_flow_sum_delays[k] = expected_transmission_delay;
+      calculated_max_delay = std::max(calculated_max_delay, expected_transmission_delay);
+      current_flow_max_path_delays[k] = expected_transmission_delay;
+    } else {
+      calculated_max_sum_delay = std::max(calculated_max_sum_delay, kMaxDelayPenalty);
+      calculated_max_delay = std::max(calculated_max_delay, kMaxDelayPenalty);
+    }
+  }
+
+  // 6. Metrics serialization directly to strictly defined struct fields
+  optimization_metrics.optimal_bandwidths = std::move(link_allocated_bandwidths);
+  optimization_metrics.optimal_powers = std::move(link_tx_powers);
+  optimization_metrics.optimal_rates = std::move(link_achieved_rates);
+  
+  optimization_metrics.max_end_to_end_delay = calculated_max_delay;
+  optimization_metrics.max_expected_sum_delay = calculated_max_sum_delay;
+  optimization_metrics.total_system_energy = total_energy_consumption;
+  
+  optimization_metrics.commodity_max_delays = std::move(current_flow_max_path_delays);
+  optimization_metrics.final_flow_routing = std::move(flow_routing_paths);
+
+  return optimization_metrics;
+}
