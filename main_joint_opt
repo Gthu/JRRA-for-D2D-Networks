@@ -1,7 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "graph.h"       
-#include "solver_dual.h" 
+#include "optimization_solvers.h" 
 #include "ipm_solver.h"
 #include <chrono>
 #include <iostream>
@@ -31,7 +31,7 @@ struct AlgoResult {
     int multipath_count;
     long long time_ms;
     
-    std::vector<std::map<Link, double>> final_x_flow;
+    std::vector<std::map<Link, double>> final_flow_routing_matrix;
     
     // Convergence trajectory history
     std::vector<double> history_F;
@@ -164,7 +164,7 @@ std::vector<AlgoResult> run_single_experiment(
         0.5, total_bandwidth_mhz, noise_density_dbm); 
 
     auto [probe_T_max, probe_T_sum, probe_E_total, probe_delays] = evaluate_network_state(
-        traffic_demands, probe_res.x_flow, probe_res.r0, probe_res.p0, probe_res.l0, total_bandwidth_mhz, num_nodes
+        traffic_demands, probe_res.flow_routing_matrix, probe_res.initial_rate_capacity, probe_res.initial_power, probe_res.initial_bandwidth, total_bandwidth_mhz, num_nodes
     );
 
     // Normalization Anchors (Zero-Division Protection)
@@ -188,12 +188,12 @@ std::vector<AlgoResult> run_single_experiment(
     }
 
     // Unpack initialization state to preserve downstream pointer/loop compatibility
-    std::vector<std::map<Link, double>> x_flow = init_res.x_flow;
-    std::vector<std::map<Link, double>> init_x_flow = init_res.init_x_flow; 
-    std::set<Link> E_active = init_res.E_active;
-    LinkMap p0 = init_res.p0;
-    LinkMap l0 = init_res.l0;
-    LinkMap r0 = init_res.r0;
+    std::vector<std::map<Link, double>> flow_routing_matrix = init_res.flow_routing_matrix;
+    std::vector<std::map<Link, double>> init_flow_routing_matrix = init_res.flow_routing_matrix; 
+    std::set<Link> E_active = init_res.active_edges;
+    LinkMap p0 = init_res.initial_power;
+    LinkMap l0 = init_res.initial_bandwidth;
+    LinkMap r0 = init_res.initial_rate_capacity;
 
     // ==================================================================================
     // 2. Connectivity Validation
@@ -207,24 +207,24 @@ std::vector<AlgoResult> run_single_experiment(
     // 3. Iteration-0 Convergence Safe Box
     // ==================================================================================
     double best_objective_value = std::numeric_limits<double>::max();
-    std::vector<std::map<Link, double>> best_x_flow = x_flow;
+    std::vector<std::map<Link, double>> best_flow_routing_matrix = flow_routing_matrix;
     OptimizationResult best_dual_res;
     
     auto [init_T_max, init_T_sum, init_E_total, init_flow_delays] = evaluate_network_state(
-        traffic_demands, x_flow, r0, p0, l0, total_bandwidth_mhz, num_nodes);
+        traffic_demands, flow_routing_matrix, r0, p0, l0, total_bandwidth_mhz, num_nodes);
     
     double initial_normalized_objective = user_alpha * (init_T_max / ANCHOR_T) + (1.0 - user_alpha) * (init_E_total / ANCHOR_E);
     
     // Pre-allocate Generation-0 bounds to prevent BCD fallback corruption
-    best_dual_res.l_opt.resize(col_gen_graph.edge_list.size(), 0.0);
-    best_dual_res.p_opt.resize(col_gen_graph.edge_list.size(), 0.0);
-    best_dual_res.r_opt.resize(col_gen_graph.edge_list.size(), 0.0);
+    best_dual_res.optimal_bandwidths.resize(col_gen_graph.edge_list.size(), 0.0);
+    best_dual_res.optimal_powers.resize(col_gen_graph.edge_list.size(), 0.0);
+    best_dual_res.optimal_rates.resize(col_gen_graph.edge_list.size(), 0.0);
 
     for (size_t i = 0; i < col_gen_graph.edge_list.size(); ++i) {
         Link lk = { static_cast<int>(std::get<0>(col_gen_graph.edge_list[i])), static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) };
-        best_dual_res.l_opt[i] = l0.count(lk) ? l0.at(lk) : 0.0;
-        best_dual_res.p_opt[i] = p0.count(lk) ? p0.at(lk) : 0.0;
-        best_dual_res.r_opt[i] = r0.count(lk) ? r0.at(lk) : 0.0;
+        best_dual_res.optimal_bandwidths[i] = l0.count(lk) ? l0.at(lk) : 0.0;
+        best_dual_res.optimal_powers[i] = p0.count(lk) ? p0.at(lk) : 0.0;
+        best_dual_res.optimal_rates[i] = r0.count(lk) ? r0.at(lk) : 0.0;
     }
     
     best_objective_value = initial_normalized_objective;
@@ -252,7 +252,7 @@ std::vector<AlgoResult> run_single_experiment(
     const double PENALTY_WEIGHT = 1e6;
 
     // Immutable baselines to ensure clean algorithmic resets
-    const std::vector<std::map<Link, double>> BASELINE_x_flow = x_flow;
+    const std::vector<std::map<Link, double>> BASELINE_flow_routing_matrix = flow_routing_matrix;
     const std::set<Link> BASELINE_E_active = E_active;
     const std::map<Link, double> BASELINE_r0 = r0;
     const std::map<Link, double> BASELINE_p0 = p0;
@@ -260,7 +260,7 @@ std::vector<AlgoResult> run_single_experiment(
     const double BASELINE_F_initial = initial_normalized_objective;
 
     std::vector<AlgoResult> summary_results;
-    std::vector<std::string> test_algorithms = { "BCD-FW", "BCD-IPM", "Game-Greedy", "Static-Allocation" }; 
+    std::vector<std::string> test_algorithms = { "BCD-FW", "BCD-IPM", "Static-Allocation" }; 
     
     std::cout << "\n>>>(user_alpha=" << user_alpha << ") <<<\n";
 
@@ -273,7 +273,7 @@ std::vector<AlgoResult> run_single_experiment(
         std::cout << "================================================================================\n";
         
         // --- 0. Hard Reset: Physical & Network State ---
-        x_flow = BASELINE_x_flow;
+        flow_routing_matrix = BASELINE_flow_routing_matrix;
         E_active = BASELINE_E_active;
         r0 = BASELINE_r0;
         p0 = BASELINE_p0;
@@ -281,7 +281,7 @@ std::vector<AlgoResult> run_single_experiment(
 
         // --- 1. Hard Reset: Convergence Safe Box ---
         best_objective_value = BASELINE_F_initial;
-        best_x_flow = BASELINE_x_flow;
+        best_flow_routing_matrix = BASELINE_flow_routing_matrix;
         best_dual_res = BASELINE_dual_res;
 
         best_T_max = init_T_max;             
@@ -301,17 +301,17 @@ std::vector<AlgoResult> run_single_experiment(
         current_hist_T_sum.clear();
         current_hist_diff.clear();
 
-        std::vector<std::map<Link, double>> prev_x_flow = BASELINE_x_flow;
+        std::vector<std::map<Link, double>> prev_flow_routing_matrix = BASELINE_flow_routing_matrix;
         
         // Optimization Configurations
         FWConfig config_fw;
-        config_fw.mu = 5.0;  
-        config_fw.alpha = effective_alpha; 
-        config_fw.tolerance = 1e-4;
-        config_fw.epsilon = 0.05;
-        config_fw.max_iter = 100;
+        config_fw.penalty_multiplier = 5.0;  
+        config_fw.step_size_alpha = effective_alpha; 
+        config_fw.convergence_tolerance = 1e-4;
+        config_fw.gradient_epsilon = 0.05;
+        config_fw.max_iterations = 100;
         
-        IPMConfig config_ipm = { 200, 1e-4, 1e-3, config_fw.mu }; 
+        IPMConfig config_ipm = { 200, 1e-4, 1e-3, config_fw.penalty_multiplier }; 
         
         auto start_algo = std::chrono::system_clock::now();
         
@@ -330,18 +330,18 @@ std::vector<AlgoResult> run_single_experiment(
             if (current_algo == "BCD-FW") {
                 std::cout << "[Routing Phase] Running BCD-FW Algorithm...\n";
                 std::map<Link, double> dynamic_edge_weights;
-                solve_frank_wolfe(graph, col_gen_graph.edge_list, num_nodes, E_active, traffic_demands, r0, p0, x_flow, config_fw, dynamic_edge_weights);
-                config_fw.mu *= 1.1; // Progressively harden LSE smoothing
+                solve_frank_wolfe(graph, col_gen_graph.edge_list, num_nodes, E_active, traffic_demands, r0, p0, flow_routing_matrix, config_fw, dynamic_edge_weights);
+                config_fw.penalty_multiplier *= 1.1; // Progressively harden LSE smoothing
             }
             else if (current_algo == "BCD-IPM") {
                 std::cout << "[Routing Phase] Running Primal-Dual BCD-IPM Algorithm...\n";
-                solve_ipm_routing(graph, col_gen_graph.edge_list, num_nodes, traffic_demands, r0, p0, x_flow, config_ipm, effective_alpha); 
-                config_ipm.mu *= 1.1;
+                solve_ipm_routing(graph, col_gen_graph.edge_list, num_nodes, traffic_demands, r0, p0, flow_routing_matrix, config_ipm, effective_alpha); 
+                config_ipm.lse_smoothing_parameter *= 1.1;
             }
             else if (current_algo == "KSP-PDA") {
                 std::cout << "[Routing Phase] Loading Static KSP-PDA Routes (Evenly split)...\n";
-                x_flow.clear();
-                x_flow.resize(traffic_demands.size());
+                flow_routing_matrix.clear();
+                flow_routing_matrix.resize(traffic_demands.size());
                 
                 int k_max_paths = 10;
                 int active_k_paths = 3;  
@@ -360,7 +360,7 @@ std::vector<AlgoResult> run_single_experiment(
                                 if (path.size() < 2) continue;
                                 for (size_t i = 0; i < path.size() - 1; ++i) {
                                     Link link = { static_cast<int>(path[i]), static_cast<int>(path[i + 1]) };
-                                    x_flow[demand_idx][link] += split_ratio;
+                                    flow_routing_matrix[demand_idx][link] += split_ratio;
                                 }
                             }
                         }
@@ -371,13 +371,13 @@ std::vector<AlgoResult> run_single_experiment(
             else if (current_algo == "Static-Allocation" || current_algo == "SP-PDA") {
                 std::cout << "[Routing Phase] Running Static Allocation (100% on Single Shortest Path)...\n";
                 for (size_t k = 0; k < traffic_demands.size(); ++k) {
-                    x_flow[k].clear();
+                    flow_routing_matrix[k].clear();
                     size_t src = std::get<0>(traffic_demands[k]);
                     size_t des = std::get<1>(traffic_demands[k]);
                     auto [p1, p1_length] = dijkstra(graph, src, des);
                     if (p1_length != 0 || src == des) {
                         for (size_t i = 0; i < p1.size() - 1; ++i) {
-                            x_flow[k][{ static_cast<int>(p1[i]), static_cast<int>(p1[i + 1]) }] = 1.0;
+                            flow_routing_matrix[k][{ static_cast<int>(p1[i]), static_cast<int>(p1[i + 1]) }] = 1.0;
                         }
                     }
                 }
@@ -393,23 +393,23 @@ std::vector<AlgoResult> run_single_experiment(
             
             if (current_algo == "Static-Allocation") {
                 std::cout << "[Resource Phase] Running Equal Resource Allocation (ERA)...\n";
-                dual_res = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
+                dual_res = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, flow_routing_matrix, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
             }
             else if (current_algo == "Game-Greedy") {
                 std::cout << "[Resource Phase] Running Game-Greedy Joint Allocation...\n";
                 dual_res = run_game_greedy_baseline(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, noise_density_dbm);
                 // Sync optimized routes generated internally back to global state
-                x_flow = dual_res.final_x_flow;
+                flow_routing_matrix = dual_res.final_flow_routing;
             }
-            else if (current_algo == "SCA-Baseline") {
+            /*else if (current_algo == "SCA-Baseline") {
                 std::cout << "[Resource Phase] Running SCA-Based Joint Allocation...\n";
                 dual_res = run_sca_baseline(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, noise_density_dbm);
-                x_flow = dual_res.final_x_flow;
-            }
+                flow_routing_matrix = dual_res.final_flow_routing;
+            }*/
             else {
                 std::cout << "[Resource Phase] Running Lagrangian Dual Decomposition...\n";
                 bool x_is_clean = true;
-                for (const auto& flow_map : x_flow) {
+                for (const auto& flow_map : flow_routing_matrix) {
                     for (const auto& pair : flow_map) {
                         if (std::isnan(pair.second) || std::isinf(pair.second)) {
                             std::cout << "  [Error] Corrupted flow x passed to LDD!\n";
@@ -421,12 +421,12 @@ std::vector<AlgoResult> run_single_experiment(
                 if (current_algo == "KSP-PDA" || current_algo == "SP-PDA") {
                     // Track 1: Baseline Mode (PDA with single fail-safe)
                     try {
-                        dual_res = run_dual_decomposition_solver(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, x_flow, noise_density_dbm, effective_alpha, 1e-2); 
+                        dual_res = run_dual_decomposition_solver(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, flow_routing_matrix, noise_density_dbm, effective_alpha, 1e-2); 
 
                         // Fail-safe circuit breaker
-                        if (dual_res.max_sum_delay > 500.0) {
+                        if (dual_res.max_expected_sum_delay > 500.0) {
                             std::cout << "  >>> [WARNING] PDA diverged! Triggering Static Equal Allocation as Safe Net.\n";
-                            dual_res = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
+                            dual_res = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, flow_routing_matrix, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
                         }
                     }
                     catch (const std::exception & e) {
@@ -441,18 +441,18 @@ std::vector<AlgoResult> run_single_experiment(
                     OptimizationResult res_ldd; 
                     
                     try {
-                        res_ldd = run_dual_decomposition_solver(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, x_flow, noise_density_dbm, effective_alpha, 1e-2);
+                        res_ldd = run_dual_decomposition_solver(col_gen_graph.edge_list, num_nodes, node_power_limits, total_bandwidth_mhz, traffic_demands, flow_routing_matrix, noise_density_dbm, effective_alpha, 1e-2);
                         
-                        if (res_ldd.max_sum_delay > 500.0) {
+                        if (res_ldd.max_expected_sum_delay > 500.0) {
                             std::cout << "  >>> [WARNING] PDA solver diverged (Delay > 500)! \n";
                             std::cout << "  >>> [Fallback] Triggering Static Equal Allocation as Safe Net.\n";
-                            res_ldd = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
+                            res_ldd = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, flow_routing_matrix, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
                         }
                     }
                     catch (const std::exception& e) {
                         std::cerr << "  >>> [WARNING] PDA Exception: " << e.what() << std::endl;
                         std::cout << "  >>> [Fallback] Triggering Static Equal Allocation as Safe Net.\n";
-                        res_ldd = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, x_flow, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
+                        res_ldd = run_static_equal_allocation(col_gen_graph.edge_list, traffic_demands, flow_routing_matrix, total_bandwidth_mhz, max_power_per_node, noise_density_dbm);
                     }
                     dual_res = res_ldd; 
                 }
@@ -471,9 +471,9 @@ std::vector<AlgoResult> run_single_experiment(
                     static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) 
                 };
 
-                double new_lambda = dual_res.l_opt[i];
-                double new_power = dual_res.p_opt[i];
-                double new_capacity = dual_res.r_opt[i];
+                double new_lambda = dual_res.optimal_bandwidths[i];
+                double new_power = dual_res.optimal_powers[i];
+                double new_capacity = dual_res.optimal_rates[i];
 
                 if (new_capacity > 1e-6) {
                     current_active_links++; 
@@ -506,13 +506,13 @@ std::vector<AlgoResult> run_single_experiment(
                     static_cast<int>(std::get<0>(col_gen_graph.edge_list[i])), 
                     static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) 
                 };
-                current_capacity_map[current_link] = dual_res.r_opt[i];
-                current_power_map[current_link] = dual_res.p_opt[i];
-                current_lambda_map[current_link] = dual_res.l_opt[i];
+                current_capacity_map[current_link] = dual_res.optimal_rates[i];
+                current_power_map[current_link] = dual_res.optimal_powers[i];
+                current_lambda_map[current_link] = dual_res.optimal_bandwidths[i];
             }
 
             auto [referee_max_delay, referee_max_sum_delay, referee_total_energy, flow_delays] = evaluate_network_state(
-                traffic_demands, x_flow, current_capacity_map, current_power_map, current_lambda_map, total_bandwidth_mhz, num_nodes
+                traffic_demands, flow_routing_matrix, current_capacity_map, current_power_map, current_lambda_map, total_bandwidth_mhz, num_nodes
             );
 
             // Track A: Surrogate Score (Used for algorithmic convergence driving)
@@ -544,7 +544,7 @@ std::vector<AlgoResult> run_single_experiment(
 
             if (is_single_shot_baseline || physical_objective < best_objective_value - 1e-5) {
                 best_objective_value = physical_objective;
-                best_x_flow = x_flow;
+                best_flow_routing_matrix = flow_routing_matrix;
                 best_dual_res = dual_res;
                 best_T_max = referee_max_delay;
                 best_E_total = referee_total_energy;
@@ -589,7 +589,7 @@ std::vector<AlgoResult> run_single_experiment(
             }
 
             prev_objective_value = surrogate_objective;
-            prev_x_flow = x_flow;
+            prev_flow_routing_matrix = flow_routing_matrix;
         }
 
         // ---------------------------------------------------------
@@ -607,19 +607,19 @@ std::vector<AlgoResult> run_single_experiment(
                 static_cast<int>(std::get<0>(col_gen_graph.edge_list[i])), 
                 static_cast<int>(std::get<1>(col_gen_graph.edge_list[i])) 
             };
-            eval_capacity_map[current_link] = (best_dual_res.r_opt.size() > i) ? best_dual_res.r_opt[i] : 0.0;
-            eval_power_map[current_link] = (best_dual_res.p_opt.size() > i) ? best_dual_res.p_opt[i] : 0.0;
-            eval_lambda_map[current_link] = (best_dual_res.l_opt.size() > i) ? best_dual_res.l_opt[i] : 0.0;
+            eval_capacity_map[current_link] = (best_dual_res.optimal_rates.size() > i) ? best_dual_res.optimal_rates[i] : 0.0;
+            eval_power_map[current_link] = (best_dual_res.optimal_powers.size() > i) ? best_dual_res.optimal_powers[i] : 0.0;
+            eval_lambda_map[current_link] = (best_dual_res.optimal_bandwidths.size() > i) ? best_dual_res.optimal_bandwidths[i] : 0.0;
         }
 
         auto [final_max_delay, final_sum_delay, final_total_energy, final_delays] = evaluate_network_state(
-            traffic_demands, best_x_flow, eval_capacity_map, eval_power_map, eval_lambda_map, total_bandwidth_mhz, num_nodes
+            traffic_demands, best_flow_routing_matrix, eval_capacity_map, eval_power_map, eval_lambda_map, total_bandwidth_mhz, num_nodes
         );
 
         int multipath_routing_count = 0;
         for (size_t k = 0; k < traffic_demands.size(); ++k) {
             std::map<int, int> node_outgoing_branches;
-            for (const auto& pair : best_x_flow[k]) {
+            for (const auto& pair : best_flow_routing_matrix[k]) {
                 if (pair.second > 0.009) { 
                     node_outgoing_branches[pair.first.first]++;
                 }
@@ -644,7 +644,7 @@ std::vector<AlgoResult> run_single_experiment(
         std::map<Link, double> edge_traffic_load;
         for (size_t k = 0; k < traffic_demands.size(); ++k) {
             double demand_volume = std::get<2>(traffic_demands[k]);
-            for (const auto& pair : best_x_flow[k]) {
+            for (const auto& pair : best_flow_routing_matrix[k]) {
                 if (pair.second > 1e-4) {
                     edge_traffic_load[pair.first] += pair.second * demand_volume;
                 }
@@ -688,14 +688,14 @@ std::vector<AlgoResult> run_single_experiment(
         current_res.total_energy = final_total_energy;    
         current_res.multipath_count = multipath_routing_count;
         current_res.time_ms = duration_ms;
-        current_res.final_x_flow = best_x_flow;
+        current_res.final_flow_routing_matrix = best_flow_routing_matrix;
         current_res.max_sum_delay = best_T_sum;
         current_res.diff_F = best_diff_F;
         current_res.flow_max_delays = std::move(final_delays);
 
-        current_res.final_p_opt = best_dual_res.p_opt;
-        current_res.final_r_opt = best_dual_res.r_opt;
-        current_res.final_l_opt = best_dual_res.l_opt;
+        current_res.final_p_opt = best_dual_res.optimal_powers;
+        current_res.final_r_opt = best_dual_res.optimal_rates;
+        current_res.final_l_opt = best_dual_res.optimal_bandwidths;
 
         current_res.energy_efficiency = energy_efficiency_mbits_per_joule;
         current_res.avg_link_delay = mean_link_congestion; 
@@ -780,9 +780,10 @@ int main() {
     const double test_stress_multiplier = 5.0;
     
     int target_topology_id = 10;
+
     std::string file_suffix = "_Boxplot_ID" + std::to_string(target_topology_id) + ".csv";
-    std::string case_graph_path = "../data/data_d2d/box_generator/graph_ScenC" + file_suffix;
-    std::string case_demand_path = "../data/data_d2d/box_generator/demand_ScenC" + file_suffix;
+    std::string case_graph_path = "data_d2d/box_generator/graph_ScenC" + file_suffix;
+    std::string case_demand_path = "data_d2d/box_generator/demand_ScenC" + file_suffix;
 
     std::cout << ">>> [Case Study] Loading Topology " << target_topology_id << " from physical storage...\n";
 
@@ -799,7 +800,7 @@ int main() {
         std::cerr << ">>> [ERROR] Profiling pipeline failed. Verify existence of Topology " << target_topology_id << ".\n";
     } else {
         const double total_system_bandwidth = 100.0;
-        std::string microscopic_analysis_file = R"(..\data\data_d2d\box_generator\detailed_path_analysis.csv)";
+        std::string microscopic_analysis_file = R"(..\data_d2d\box_generator\detailed_path_analysis.csv)";
 
         for (const auto& res : case_results) {
             std::map<Link, double> eval_capacity_map, eval_power_map, eval_lambda_map;
@@ -813,16 +814,16 @@ int main() {
                 eval_lambda_map[current_link] = (res.final_l_opt.size() > i) ? res.final_l_opt[i] : 0.0;
             }
 
-            export_commodity_path_details(
+            /*export_commodity_path_details(
                 microscopic_analysis_file,
                 res.name,
                 target_traffic_demands,
-                res.final_x_flow,
+                res.final_flow_routing_matrix,
                 eval_capacity_map,
                 eval_power_map,
                 eval_lambda_map,
                 total_system_bandwidth 
-            );
+            );*/
         }
     }
 
