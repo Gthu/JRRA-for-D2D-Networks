@@ -1,489 +1,625 @@
-#include "graph.h"
-#include <iostream>
-#include <vector>
-#include <map>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <iomanip>
+#include <iostream>
 #include <limits>
+#include <map>
 #include <queue>
-#include <unordered_map>
 #include <set>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
+
+#include "graph.h"
+
+// =========================================================
+// Oracle Subproblems & Utilities
+// =========================================================
 
 /**
- * @brief Computes the shortest path using a dynamic edge weight map.
- * 
- * @param graph The network topology structure.
- * @param num_nodes Total number of nodes in the network.
- * @param src Source node index.
- * @param dst Destination node index.
- * @param weights Dynamic weight map where keys are directed links and values are marginal costs.
- * @return std::vector<Link> The sequence of edges forming the shortest path.
- * 
- * @note Includes a robustness mechanism: if a physical edge exists but lacks a defined 
- * weight in the map, it is assigned a heavy penalty (1e9) instead of being treated as disconnected. 
- * This prevents artificial flow truncations while strongly discouraging its use unless absolutely necessary.
+ * @brief Computes the shortest path under dynamic, real-time edge penalties.
+ * @param graph The underlying network topology for connectivity references.
+ * @param num_nodes Total vertices in the graph.
+ * @param source_node The origin node index.
+ * @param target_node The destination node index.
+ * @param dynamic_weights The dynamically updated penalty/cost mapping for active and potential links.
+ * @return std::vector<Link> The sequence of edges forming the optimal path.
+ * @note Operates as the linear optimization oracle within the Frank-Wolfe algorithm. 
+ * Incorporates a robust physical-fallback mechanism: if a physical edge lacks a mapped weight, 
+ * it is assigned an extreme penalty (1e9) rather than being disconnected, preventing zero-flow deadlocks 
+ * while heavily discouraging its use. Time complexity: O(E + V \log V).
  */
 std::vector<Link> dijkstra_weighted(
     const Graph& graph,
-    size_t num_nodes,
-    int src,
-    int dst,
-    const std::map<Link, double>& weights
+    std::size_t num_nodes,
+    int source_node,
+    int target_node,
+    const std::map<Link, double>& dynamic_weights
 ) {
-    std::vector<double> dist(num_nodes, std::numeric_limits<double>::max());
-    std::vector<int> parent(num_nodes, -1);
+    std::vector<double> min_distances(num_nodes, std::numeric_limits<double>::max());
+    std::vector<int> predecessors(num_nodes, -1);
 
     using PII = std::pair<double, int>;
-    std::priority_queue<PII, std::vector<PII>, std::greater<PII>> pq;
+    std::priority_queue<PII, std::vector<PII>, std::greater<PII>> priority_queue;
 
-    dist[src] = 0.0;
-    pq.push({ 0.0, src });
+    min_distances[source_node] = 0.0;
+    priority_queue.push({ 0.0, source_node });
 
-    while (!pq.empty()) {
-        double d = pq.top().first;
-        int u = pq.top().second;
-        pq.pop();
+    const double kInfinitePenalty = 1e9;
 
-        if (d > dist[u]) continue;
-        if (u == dst) break;
+    while (!priority_queue.empty()) {
+        double current_distance = priority_queue.top().first;
+        int u = priority_queue.top().second;
+        priority_queue.pop();
+
+        if (current_distance > min_distances[u]) continue;
+        if (u == target_node) break;
 
         if (u < graph.adj.size()) {
             for (const auto& edge : graph.adj[u]) {
                 int v = edge.first; 
                 if (v >= num_nodes) continue;
 
-                Link link = { u, v }; 
-                double w;
+                Link current_link = { u, v }; 
 
-                if (weights.count(link)) {
-                    w = weights.at(link);
+                double link_weight;
+
+                // === [Robustness Injection: Directed Graph Safety] ===
+                if (dynamic_weights.count(current_link)) {
+                    link_weight = dynamic_weights.at(current_link);
                 } else {
-                    // Fallback penalty for undefined physical links
-                    w = 1e9;
+                    // Critical fallback: Preserve physical connectivity to prevent solver crashes.
+                    // Assign a massive penalty so Dijkstra only utilizes this link if absolutely necessary.
+                    link_weight = kInfinitePenalty;
                 }
+                // ====================================================
 
-                if (dist[u] + w < dist[v]) {
-                    dist[v] = dist[u] + w;
-                    parent[v] = u;
-                    pq.push({ dist[v], v });
+                if (min_distances[u] + link_weight < min_distances[v]) {
+                    min_distances[v] = min_distances[u] + link_weight;
+                    predecessors[v] = u;
+                    priority_queue.push({ min_distances[v], v });
                 }
             }
         }
     }
 
-    std::vector<Link> path;
-    if (dist[dst] == std::numeric_limits<double>::max()) {
-        return path; 
+    std::vector<Link> optimal_path;
+    if (min_distances[target_node] == std::numeric_limits<double>::max()) {
+        return optimal_path; 
     }
 
-    int curr = dst;
-    while (curr != src) {
-        int prev = parent[curr];
-        if (prev == -1) break;
-        path.push_back({ prev, curr });
-        curr = prev;
+    int current_vertex = target_node;
+    while (current_vertex != source_node) {
+        int previous_vertex = predecessors[current_vertex];
+        if (previous_vertex == -1) break;
+        optimal_path.push_back({ previous_vertex, current_vertex });
+        current_vertex = previous_vertex;
     }
-    std::reverse(path.begin(), path.end());
+    std::reverse(optimal_path.begin(), optimal_path.end());
 
-    return path;
+    return optimal_path;
 }
 
 /**
- * @brief Computes Softmax weights using the Log-Sum-Exp trick to prevent numerical overflow.
- * 
- * @param T_k Vector of delay values for each commodity.
- * @param mu The barrier penalty coefficient.
- * @return std::vector<double> Normalized softmax weights.
+ * @brief Computes the Log-Sum-Exp (LSE) stabilized softmax weights.
+ * @param commodity_delays The vector of expected delays for all commodity paths.
+ * @param lse_smoothing_parameter The $\mu$ parameter controlling the approximation strictness.
+ * @return std::vector<double> The stabilized gradient coefficients ($\beta_k$).
+ * @note Mitigates numerical overflow by shifting the exponentiated values by the maximum delay.
  */
-std::vector<double> calculate_softmax_beta(const std::vector<double>& T_k, double mu) {
-    std::vector<double> beta(T_k.size());
-    if (T_k.empty()) return beta;
+std::vector<double> calculate_softmax_beta(const std::vector<double>& commodity_delays, double lse_smoothing_parameter) {
+    std::vector<double> softmax_weights(commodity_delays.size());
+    if (commodity_delays.empty()) return softmax_weights;
 
-    double max_T = *std::max_element(T_k.begin(), T_k.end());
+    double max_delay = *std::max_element(commodity_delays.begin(), commodity_delays.end());
 
-    double sum_exp = 0.0;
-    for (double t : T_k) {
-        sum_exp += std::exp(mu * (t - max_T));
+    double sum_exponentials = 0.0;
+    for (double t : commodity_delays) {
+        sum_exponentials += std::exp(lse_smoothing_parameter * (t - max_delay));
     }
 
-    for (size_t k = 0; k < T_k.size(); ++k) {
-        beta[k] = std::exp(mu * (T_k[k] - max_T)) / sum_exp;
+    for (std::size_t k = 0; k < commodity_delays.size(); ++k) {
+        softmax_weights[k] = std::exp(lse_smoothing_parameter * (commodity_delays[k] - max_delay)) / sum_exponentials;
     }
-    return beta;
+    
+    return softmax_weights;
 }
 
-/**
- * @brief Executes the Frank-Wolfe (FW) algorithm for the routing subproblem.
- * 
- * @param graph The network topology.
- * @param edge_list Tuple list of all edges.
- * @param num_nodes Total number of nodes.
- * @param E_active Set of active physical links to be updated.
- * @param traffic_demands The demand matrix data.
- * @param r0 Initial or current physical rates of the links.
- * @param p0 Initial or current power allocations of the links.
- * @param flow_fractions The routing variables to be optimized.
- * @param config FW algorithm configuration parameters (mu, alpha, max iterations).
- * @param dynamic_edge_weights Pre-calculated penalties for blocked or congested edges.
- * 
- * @note This function integrates a loop-elimination Flow Decomposition phase (via BFS) 
- * and ping-pong flow cancellation to ensure the final output is a pure Directed Acyclic Graph (DAG).
- */
+// =========================================================
+// Frank-Wolfe Optimization Solver (Part 1)
+// =========================================================
+
 void solve_frank_wolfe(
     const Graph& graph,
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
-    size_t num_nodes,
-    std::set<Link>& E_active,
-    const std::vector<std::tuple<size_t, size_t, double>>& traffic_demands,
-    const LinkMap& r0,
-    const LinkMap& p0,
-    std::vector<std::map<Link, double>>& flow_fractions,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& network_edges,
+    std::size_t num_nodes,
+    std::set<Link>& active_edges,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const LinkMap& rate_capacities,
+    const LinkMap& power_allocations,
+    std::vector<std::map<Link, double>>& flow_routing_matrix,
     FWConfig config,
     const std::map<Link, double>& dynamic_edge_weights
 ) {
-    std::cout << "\n>>> Invoke Frank-Wolfe solver (mu=" << config.mu << ", alpha=" << config.alpha << ") <<<" << std::endl;
+    // Note: config.alpha is functionally mapping to the tradeoff/fairness parameter here based on your math.
+    std::cout << "\n>>> Invoke Frank-Wolfe solver (mu=" << config.penalty_multiplier 
+              << ", alpha=" << config.step_size_alpha << ") <<<\n";
 
-    if (r0.empty()) {
-        std::cerr << "[Error] Rate map (r0) is empty! FW cannot proceed." << std::endl;
+    if (rate_capacities.empty()) {
+        std::cerr << "[Fatal Error] rate_capacities (r0) map is empty! FW aborted.\n";
         return;
     }
 
-    int iter = 1;
-    double prev_obj_value = std::numeric_limits<double>::max();
-    double min_gap_so_far = std::numeric_limits<double>::max();
+    int current_iteration = 1;
+    double previous_objective_value = std::numeric_limits<double>::max();
+    double previous_duality_gap = std::numeric_limits<double>::max();
+
+    double minimum_duality_gap = std::numeric_limits<double>::max();
+    std::vector<std::map<Link, double>> best_flow_routing_matrix = flow_routing_matrix;
+    double best_objective_value = std::numeric_limits<double>::max();
+    int best_iteration_index = -1; 
+    std::string termination_reason = "Max Iter reached"; 
     
-    std::vector<std::map<Link, double>> best_flow_fractions = flow_fractions;
-    double best_obj_val = std::numeric_limits<double>::max();
-    int best_iter_idx = -1; 
-    std::string stop_reason = "Max Iter reached"; 
+    constexpr double kVirtualCapacityFallback = 0.01; 
 
-    while (iter <= config.max_iter) {
+    while (current_iteration <= config.max_iterations) {
 
         // =========================================================
-        // Step 1: Evaluate Current State & Compute Objective
+        // Step 0 & 1: State Evaluation & Gradient Computation
         // =========================================================
-        std::vector<double> T_k(traffic_demands.size(), 0.0);
-        double total_energy_term = 0.0; 
+        std::vector<double> commodity_delays(commodity_demands.size(), 0.0);
+        double total_energy_penalty = 0.0; 
+        std::map<Link, double> aggregate_link_flows;
 
-        for (size_t k = 0; k < traffic_demands.size(); ++k) {
-            double M_k = std::get<2>(traffic_demands[k]);
-            for (const auto& pair : flow_fractions[k]) {
-                Link link = pair.first;
-                double flow_val = pair.second;
-                if (flow_val < 1e-9) continue;
+        for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+            double traffic_volume = std::get<2>(commodity_demands[k]);
+            for (const auto& pair : flow_routing_matrix[k]) {
+                Link current_link = pair.first;
+                double flow_fraction = pair.second;
+                
+                if (flow_fraction < 1e-9) continue;
+                
+                double real_rate = rate_capacities.count(current_link) ? rate_capacities.at(current_link) : 1e-9;
+                double safe_rate = std::max(real_rate, kVirtualCapacityFallback);
+                double allocated_power = (power_allocations.count(current_link)) ? power_allocations.at(current_link) : 0.0;
 
-                double r = (r0.count(link)) ? r0.at(link) : 1e-9;
-                double p = (p0.count(link)) ? p0.at(link) : 0.0;
-                if (r < 1e-9) r = 1e-9;
-
-                T_k[k] += flow_val * (M_k / r);
-                total_energy_term += flow_val * (1.0 - config.alpha) * M_k * (p / r);
+                commodity_delays[k] += flow_fraction * (traffic_volume / safe_rate);
+                total_energy_penalty += flow_fraction * (1.0 - config.step_size_alpha) * traffic_volume * (allocated_power / safe_rate);
+                aggregate_link_flows[current_link] += flow_fraction * traffic_volume;
             }
+        }
+
+        // ---------------------------------------------------------
+        // Integral Objective Correction for the Congestion Penalty
+        // Gradient: c * (f_e / r) -> Integral: 0.5 * c * (f_e^2 / r)
+        // ---------------------------------------------------------
+        constexpr double kMultipathSensitivityGamma = 0.0; // Tunes multipath exploration aggression
+        double congestion_objective_penalty = 0.0;
+        
+        for (const auto& pair : aggregate_link_flows) {
+            double actual_flow = pair.second;
+            congestion_objective_penalty += 0.5 * kMultipathSensitivityGamma * config.gradient_epsilon * actual_flow * actual_flow;
         }
         
-        double max_T = T_k.empty() ? 0.0 : *std::max_element(T_k.begin(), T_k.end());
-
-        double sum_exp = 0.0;
-        for (double t : T_k) sum_exp += std::exp(config.mu * (t - max_T));
-        if (sum_exp < 1e-9) sum_exp = 1e-9;
-
-        double obj_val = (config.alpha / config.mu) * (config.mu * max_T + std::log(sum_exp)) + total_energy_term;
-        prev_obj_value = obj_val;
-
-        // =========================================================
-        // Step 2: Find Descent Direction (Shortest Path Subproblem)
-        // =========================================================
-        std::vector<std::map<Link, double>> candidate_flow(traffic_demands.size());
-        std::vector<double> beta_k(traffic_demands.size());
-        std::vector<std::map<Link, double>> derivative_weights(traffic_demands.size());
-
-        for (size_t k = 0; k < traffic_demands.size(); ++k) {
-            beta_k[k] = std::exp(config.mu * (T_k[k] - max_T)) / sum_exp;
+        double max_commodity_delay = 0.0;
+        if (!commodity_delays.empty()) {
+            max_commodity_delay = *std::max_element(commodity_delays.begin(), commodity_delays.end());
         }
 
-        auto get_link_weight = [&](Link l, double beta, double M_k) -> double {
-            if (dynamic_edge_weights.count(l)) return dynamic_edge_weights.at(l);
+        double sum_exponentials = 0.0;
+        for (double t : commodity_delays) {
+            sum_exponentials += std::exp(config.penalty_multiplier * (t - max_commodity_delay));
+        }
+        if (sum_exponentials < 1e-9) sum_exponentials = 1e-9;
 
-            double r = (r0.count(l)) ? r0.at(l) : 1e-9;
-            double p = (p0.count(l)) ? p0.at(l) : 0.0;
-            if (r < 1e-9) r = 1e-9;
+        double current_objective_value = (config.step_size_alpha / config.penalty_multiplier) * (config.penalty_multiplier * max_commodity_delay + std::log(sum_exponentials)) + 
+                                         total_energy_penalty + 
+                                         congestion_objective_penalty;
 
-            return config.alpha * (beta + config.epsilon) * (M_k / r) + (1.0 - config.alpha) * M_k * (p / r);
+        double previous_diff_gap = (current_iteration > 0) ? std::abs(previous_objective_value - current_objective_value) : 1.0;
+        previous_objective_value = current_objective_value;
+
+        // =========================================================
+        // Step 2: Descent Direction Search (Shortest Path Subproblem)
+        // =========================================================
+        std::vector<std::map<Link, double>> subproblem_routing_matrix(commodity_demands.size());
+        std::vector<double> softmax_weights(commodity_demands.size());
+        std::vector<std::map<Link, double>> commodity_link_weights(commodity_demands.size());
+
+        for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+            softmax_weights[k] = std::exp(config.penalty_multiplier * (commodity_delays[k] - max_commodity_delay)) / sum_exponentials;
+        }
+
+        auto get_link_weight = [&](Link l, double beta, double traffic_vol) -> double {
+            double real_rate = rate_capacities.count(l) ? rate_capacities.at(l) : 1e-9;
+            double safe_rate = std::max(real_rate, kVirtualCapacityFallback);
+            double allocated_power = (power_allocations.count(l)) ? power_allocations.at(l) : 0.0;
+            double exploration_rate = std::max(safe_rate, 0.1); 
+
+            // Base mathematical gradient 
+            double base_weight = config.step_size_alpha * (beta + config.gradient_epsilon) * (traffic_vol / exploration_rate) + 
+                                 (1.0 - config.step_size_alpha) * traffic_vol * (allocated_power / exploration_rate);
+                                 
+            // Dynamic congestion penalty injection (Traffic-aware)
+            double current_link_flow = aggregate_link_flows.count(l) ? aggregate_link_flows.at(l) : 0.0;
+            double congestion_penalty = kMultipathSensitivityGamma * config.gradient_epsilon * current_link_flow * traffic_vol;
+
+            return base_weight + congestion_penalty;
         };
 
-        for (size_t k = 0; k < traffic_demands.size(); ++k) {
-            double M_k = std::get<2>(traffic_demands[k]);
-            size_t src = std::get<0>(traffic_demands[k]);
-            size_t des = std::get<1>(traffic_demands[k]);
+        for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+            double traffic_volume = std::get<2>(commodity_demands[k]);
+            std::size_t source_node = std::get<0>(commodity_demands[k]);
+            std::size_t target_node = std::get<1>(commodity_demands[k]);
 
-            std::map<Link, double>& current_weights = derivative_weights[k]; 
-            for (const auto& edge : edge_list) {
+            std::map<Link, double>& current_weights = commodity_link_weights[k]; 
+            
+            for (const auto& edge : network_edges) {
                 int u = static_cast<int>(std::get<0>(edge));
                 int v = static_cast<int>(std::get<1>(edge));
-                Link l = { u, v };
-                current_weights[l] = get_link_weight(l, beta_k[k], M_k);
+                Link current_link = { u, v };
+                current_weights[current_link] = get_link_weight(current_link, softmax_weights[k], traffic_volume);
             }
 
-            std::vector<Link> path = dijkstra_weighted(graph, num_nodes, (int)src, (int)des, current_weights);
-            if (!path.empty()) {
-                for (const auto& l : path) candidate_flow[k][l] = 1.0;
+            std::vector<Link> shortest_path = dijkstra_weighted(graph, num_nodes, static_cast<int>(source_node), static_cast<int>(target_node), current_weights);
+            
+            if (!shortest_path.empty()) {
+                for (const auto& l : shortest_path) {
+                    subproblem_routing_matrix[k][l] = 1.0;
+                }
             }
         }
 
         // =========================================================
-        // Step 3: Curvature Calculation & Dual Gap
+        // Step 3: Curvature Calculation & Energy Prep
         // =========================================================
         double numerator_gap = 0.0;
         double sum_beta_u_sq = 0.0;
         double sum_beta_u = 0.0;
-        bool valid_path_exists = false;
+        bool any_subproblem_valid = false;
 
-        std::vector<double> candidate_T(traffic_demands.size(), 0.0);
-        double candidate_energy = 0.0; 
+        std::vector<double> subproblem_delays(commodity_demands.size(), 0.0);
+        double subproblem_energy_term = 0.0; 
 
-        for (size_t k = 0; k < traffic_demands.size(); ++k) {
-            if (candidate_flow[k].empty()) {
-                candidate_T[k] = 1e15;
+        for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+            if (subproblem_routing_matrix[k].empty()) {
+                subproblem_delays[k] = 1e15;
                 continue;
             }
-            valid_path_exists = true;
-            double M_k = std::get<2>(traffic_demands[k]);
+            any_subproblem_valid = true;
+            double traffic_volume = std::get<2>(commodity_demands[k]);
 
-            for (const auto& pair : candidate_flow[k]) {
-                Link l = pair.first;
-                double r = (r0.count(l)) ? r0.at(l) : 1e-9;
-                double p = (p0.count(l)) ? p0.at(l) : 0.0;
-                if (r < 1e-9) r = 1e-9;
+            // Compute physical properties of the new subproblem path (Y)
+            for (const auto& pair : subproblem_routing_matrix[k]) {
+                Link current_link = pair.first;
+                double real_rate = rate_capacities.count(current_link) ? rate_capacities.at(current_link) : 1e-9;
+                double safe_rate = std::max(real_rate, kVirtualCapacityFallback);
+                double exploration_rate = std::max(safe_rate, 0.1);
+                double allocated_power = (power_allocations.count(current_link)) ? power_allocations.at(current_link) : 0.0;
 
-                candidate_T[k] += (M_k / r);
-                candidate_energy += 1.0 * (1.0 - config.alpha) * M_k * (p / r); 
+                subproblem_delays[k] += (traffic_volume / exploration_rate);
+                subproblem_energy_term += 1.0 * (1.0 - config.step_size_alpha) * traffic_volume * (allocated_power / exploration_rate); 
             }
 
-            double u_k = candidate_T[k] - T_k[k];
-            sum_beta_u_sq += beta_k[k] * (u_k * u_k);
-            sum_beta_u += beta_k[k] * u_k;
+            // Compute LSE curvature-related terms
+            double delay_difference_u = subproblem_delays[k] - commodity_delays[k];
+            sum_beta_u_sq += softmax_weights[k] * (delay_difference_u * delay_difference_u);
+            sum_beta_u += softmax_weights[k] * delay_difference_u;
 
-            double cost_x = 0.0;
-            double cost_y = 0.0;
+            // [Robust Lookup]: Defend against "Phantom Edges" potentially injected by KSP initialization
+            double current_state_cost = 0.0;
+            double subproblem_cost = 0.0;
+            double current_traffic_vol = std::get<2>(commodity_demands[k]); 
 
-            for (auto& p : flow_fractions[k]) {
-                auto it = derivative_weights[k].find(p.first);
-                if (it != derivative_weights[k].end()) {
-                    cost_x += p.second * it->second;
+            for (auto& pair : flow_routing_matrix[k]) {
+                auto iterator = commodity_link_weights[k].find(pair.first);
+                if (iterator != commodity_link_weights[k].end()) {
+                    current_state_cost += pair.second * iterator->second;
                 } else {
-                    std::cout << "[Warning] Phantom edge detected (not in edge_list): Node "
-                              << p.first.first << " -> Node " << p.first.second
-                              << " (Flow: " << p.second << ")" << std::endl;
-                    cost_x += p.second * get_link_weight(p.first, beta_k[k], M_k);
+                    // [Audit Alert]: Edge detected in routing matrix that is absent from edge_list
+                    std::cerr << "[Warning] Phantom Edge Detected (Absent from master edge_list): Node "
+                              << pair.first.first << " -> Node " << pair.first.second
+                              << " (Routing Fraction: " << pair.second << ")\n";
+                    current_state_cost += pair.second * get_link_weight(pair.first, softmax_weights[k], current_traffic_vol);
                 }
             }
 
-            for (auto& p : candidate_flow[k]) {
-                auto it = derivative_weights[k].find(p.first);
-                double w = (it != derivative_weights[k].end()) ? it->second : get_link_weight(p.first, beta_k[k], M_k);
-                cost_y += 1.0 * w; 
+            for (auto& pair : subproblem_routing_matrix[k]) {
+                auto iterator = commodity_link_weights[k].find(pair.first);
+                double edge_weight = (iterator != commodity_link_weights[k].end()) 
+                                     ? iterator->second 
+                                     : get_link_weight(pair.first, softmax_weights[k], current_traffic_vol);
+                subproblem_cost += 1.0 * edge_weight; // Subproblem flow fraction is always 1.0 (pure SP)
             }
 
-            numerator_gap += (cost_x - cost_y);
+            numerator_gap += (current_state_cost - subproblem_cost);
         }
         
-        if (numerator_gap < 0.0) numerator_gap = 0.0; 
+        if (numerator_gap < 0.0) {
+            numerator_gap = 0.0; // Filter floating-point jitter
+        }
 
-        if (!valid_path_exists) {
-            std::cerr << "[Fatal] No valid candidate paths found." << std::endl;
+        if (!any_subproblem_valid) {
+            std::cerr << "[Fatal Error] No valid descent directions found across all commodities.\n";
             break;
         }
 
-        if (numerator_gap < min_gap_so_far) {
-            min_gap_so_far = numerator_gap;
-            best_obj_val = prev_obj_value;
-            best_flow_fractions = flow_fractions;
-            best_iter_idx = iter; 
+        // --- Post-Calculation Updates ---
+        if (numerator_gap < minimum_duality_gap) {
+            minimum_duality_gap = numerator_gap;
+            best_objective_value = previous_objective_value;
+            best_flow_routing_matrix = flow_routing_matrix;
+            best_iteration_index = current_iteration; 
         }
         
-        if (numerator_gap < config.tolerance) {
-            std::cout << ">>> Algorithm convergence (Gap < Tolerance)." << std::endl;
-            stop_reason = "Satisfying (Gap < Tolerance)"; 
+        // Convergence Check
+        if (numerator_gap < config.convergence_tolerance) {
+            std::cout << ">>> Algorithm convergence achieved (Duality Gap < Tolerance).\n";
+            termination_reason = "Satisfying (Gap < Tolerance)"; 
             break;
         }
 
-        double variance = sum_beta_u_sq - (sum_beta_u * sum_beta_u);
-        if (variance < 0) variance = 0.0;
-        double C_n = config.alpha * config.mu * variance; 
+        double delay_variance = sum_beta_u_sq - (sum_beta_u * sum_beta_u);
+        if (delay_variance < 0.0) delay_variance = 0.0;
+        
+        // Curvature contribution strictly derived from the non-linear LSE component
+        double lse_curvature = config.step_size_alpha * config.penalty_multiplier * delay_variance; 
 
         // =========================================================
-        // Step 4: Step Size Calculation (Line Search)
+        // Step 4: Step Size Calculation (Exact Hessian Formulation)
         // =========================================================
-        double optimal_lambda = 1.0;
 
-        if (C_n > 1e-8) {
-            double newton_lambda = numerator_gap / C_n;
-            double max_allowed_lambda = (iter > 15) ? 0.6 : 1.0;
-            optimal_lambda = std::min(max_allowed_lambda, std::max(0.0, newton_lambda));
+        // 1. Exact second-order derivative (Hessian) for the quadratic penalty term
+        double exact_penalty_curvature = 0.0;
+        std::map<Link, double> flow_volume_delta; 
+
+        for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+            if (subproblem_routing_matrix[k].empty()) continue;
+            double traffic_volume = std::get<2>(commodity_demands[k]);
+            for (const auto& pair : subproblem_routing_matrix[k]) {
+                flow_volume_delta[pair.first] += pair.second * traffic_volume; 
+            }
+        }
+        
+        for (const auto& pair : aggregate_link_flows) {
+            flow_volume_delta[pair.first] -= pair.second;
         }
 
-        std::cout << "Iter " << iter << " | Gap: " << numerator_gap << " | Lambda: " << optimal_lambda << std::endl;
+        // Aggregate curvature. Scaling factor MUST match the gradient injection: gamma * epsilon
+        for (const auto& pair : flow_volume_delta) {
+            double link_flow_diff = pair.second;
+            exact_penalty_curvature += kMultipathSensitivityGamma * config.gradient_epsilon * (link_flow_diff * link_flow_diff);
+        }
 
-        if (optimal_lambda < 1e-9 && numerator_gap > 1.0) optimal_lambda = 1e-5;
+        // 2. Fusion: Total Curvature = LSE Curvature + Exact Penalty Curvature
+        double total_system_curvature = lse_curvature + exact_penalty_curvature;
+        double optimal_step_size = 0.0;
+
+        // Exact Newton-based Step Size Optimization
+        if (total_system_curvature > 1e-12) {
+            double newton_step = numerator_gap / total_system_curvature;
+            // Retain trust-region bound to prevent non-convex oscillation during early severe congestion
+            double max_allowed_step = 0.6 / std::sqrt(current_iteration + 1.0);
+            optimal_step_size = std::min(max_allowed_step, std::max(0.0, newton_step));
+        } else {
+            // Degenerate curvature fallback to standard asymptotic decay
+            optimal_step_size = std::min(0.25, 2.0 / (current_iteration + 2.0));
+        }
+
+        // Enforce minimum propulsion to prevent premature algorithmic stalling
+        if (optimal_step_size < 1e-5 && numerator_gap > 1e-3) {
+            optimal_step_size = 1e-4;
+        }
 
         // =========================================================
-        // Step 5: State Update 
+        // Step 5: Decision Variable Update (Convex Combination)
         // =========================================================
-        for (size_t k = 0; k < traffic_demands.size(); ++k) {
-            if (candidate_flow[k].empty()) continue;
+        for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+            if (subproblem_routing_matrix[k].empty()) continue;
 
-            for (auto it = flow_fractions[k].begin(); it != flow_fractions[k].end(); ) {
-                it->second *= (1.0 - optimal_lambda);
-                if (it->second < 1e-9) it = flow_fractions[k].erase(it);
-                else ++it;
+            // Scale current state: x_new = (1 - lambda) * x_old
+            for (auto iterator = flow_routing_matrix[k].begin(); iterator != flow_routing_matrix[k].end(); ) {
+                iterator->second *= (1.0 - optimal_step_size);
+                if (iterator->second < 1e-9) {
+                    iterator = flow_routing_matrix[k].erase(iterator);
+                } else {
+                    ++iterator;
+                }
             }
             
-            for (const auto& pair : candidate_flow[k]) {
-                flow_fractions[k][pair.first] += optimal_lambda * pair.second; 
+            // Add subproblem direction: x_new += lambda * y
+            for (const auto& pair : subproblem_routing_matrix[k]) {
+                flow_routing_matrix[k][pair.first] += optimal_step_size * pair.second; 
             }
         }
-        iter++;
+
+        current_iteration++;
     } 
 
     // =========================================================
-    // Final Verification & Flow Decomposition
+    // Convergence Diagnostics & State Restoration
     // =========================================================
-    std::cout << "\n========================================================" << std::endl;
-    std::cout << "               Frank-Wolfe Results" << std::endl;
-    std::cout << "========================================================" << std::endl;
-    std::cout << "Stop Reason : " << stop_reason << std::endl;
-    std::cout << "Iteration   : " << iter << " / " << config.max_iter << std::endl;
 
-    double rel_gap = (std::abs(best_obj_val) > 1e-9) ? (min_gap_so_far / std::abs(best_obj_val)) : 1.0;
+    std::cout << "\n========================================================\n"
+              << "             Frank-Wolfe Optimization Summary           \n"
+              << "========================================================\n"
+              << "Termination Reason : " << termination_reason << "\n"
+              << "Iterations         : " << (current_iteration - 1) << " / " << config.max_iterations << "\n";
 
-    std::cout << "Best Result : Iter " << best_iter_idx
-              << " (Gap = " << min_gap_so_far
-              << ", RelGap = " << std::fixed << std::setprecision(3) << rel_gap * 100.0 << "%)" << std::endl;
-    std::cout << "Final Obj   : " << std::defaultfloat << best_obj_val << std::endl;
-    std::cout << "--------------------------------------------------------" << std::endl;
+    double relative_gap = (std::abs(best_objective_value) > 1e-9) ? (minimum_duality_gap / std::abs(best_objective_value)) : 1.0;
 
-    if (iter - best_iter_idx > 50) {
-        std::cout << "[Note] Best solution obtained at Iter " << best_iter_idx << std::endl;
-        std::cout << "       Subsequent " << (iter - best_iter_idx) << " iterations yielded no improvement." << std::endl;
+    std::cout << "Optimal Iterate    : Iter " << best_iteration_index
+              << " (Abs Gap = " << std::defaultfloat << minimum_duality_gap
+              << ", Rel Gap = " << std::fixed << std::setprecision(3) << relative_gap * 100.0 << "%)\n"
+              << "Optimal Objective  : " << std::defaultfloat << best_objective_value << "\n"
+              << "--------------------------------------------------------\n";
+
+    if ((current_iteration - 1) - best_iteration_index > 50) {
+        std::cout << "[Note] Optimal solution acquired early at Iteration " << best_iteration_index << ".\n"
+                  << "       Subsequent " << ((current_iteration - 1) - best_iteration_index) 
+                  << " iterations yielded no strict descent.\n";
     }
-    std::cout << "========================================================" << std::endl;
-    std::cout << ">>> Recovering best solution (Gap = " << min_gap_so_far << ") <<<" << std::endl;
+    std::cout << "========================================================\n\n";
 
-    // Execute Ping-Pong Canceling & BFS Flow Decomposition
-    std::cout << ">>> Executing Flow Decomposition (Loop Removal) <<<" << std::endl;
+    // =========================================================
+    // Core Upgrade: Max-Bottleneck Top-K Flow Decomposition
+    // Cleanses macro-routing cycles and extracts pure DAG multipaths
+    // =========================================================
+    std::cout << ">>> Executing Flow Decomposition (Top-K Max-Bottleneck) <<<\n";
 
-    for (size_t k = 0; k < traffic_demands.size(); ++k) {
-        int src = (int)std::get<0>(traffic_demands[k]);
-        int des = (int)std::get<1>(traffic_demands[k]);
+    struct ExtractedPath {
+        std::vector<Link> edges;
+        double volume;
+    };
 
-        std::map<Link, double> cleaned_flow;
-        std::map<Link, double>& raw_flow = best_flow_fractions[k];
+    for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+        int source_node = static_cast<int>(std::get<0>(commodity_demands[k]));
+        int target_node = static_cast<int>(std::get<1>(commodity_demands[k]));
 
-        // Ping-Pong Canceling (Bi-directional elimination)
-        for (auto& pair : raw_flow) {
+        std::map<Link, double>& raw_optimal_flow = best_flow_routing_matrix[k];
+
+        // 1. Physical Ping-Pong Cycle Cancellation
+        for (auto& pair : raw_optimal_flow) {
             int u = pair.first.first;
             int v = pair.first.second;
 
-            if (u < v && raw_flow.count({ v, u })) {
-                double f1 = pair.second;
-                double f2 = raw_flow[{v, u}];
+            if (u < v && raw_optimal_flow.count({ v, u })) {
+                double f_forward = pair.second;
+                double f_reverse = raw_optimal_flow[{v, u}];
 
-                if (f1 > f2) {
-                    pair.second = f1 - f2;            
-                    raw_flow[{v, u}] = 0.0;            
+                if (f_forward > f_reverse) {
+                    pair.second = f_forward - f_reverse;
+                    raw_optimal_flow[{v, u}] = 0.0;
                 } else {
-                    raw_flow[{v, u}] = f2 - f1;        
-                    pair.second = 0.0;                 
+                    raw_optimal_flow[{v, u}] = f_reverse - f_forward;
+                    pair.second = 0.0;
                 }
             }
         }
 
-        double extracted_total = 0.0;
-        double target_flow = 1.0;
+        std::vector<ExtractedPath> all_extracted_paths;
+        double total_extracted_volume = 0.0;
 
-        std::unordered_map<int, std::vector<std::pair<int, double>>> adj_list;
-        for (const auto& pair : raw_flow) {
-            if (pair.second > 1e-9) {
-                adj_list[pair.first.first].push_back({ pair.first.second, pair.second });
+        // 2. Iterative Max-Bottleneck Path Extraction
+        while (true) {
+            std::priority_queue<std::pair<double, int>> bottleneck_pq;
+            std::map<int, double> bottleneck_capacities;
+            std::map<int, int> traversal_parents;
+
+            for (std::size_t i = 0; i < num_nodes; ++i) {
+                bottleneck_capacities[static_cast<int>(i)] = 0.0;
             }
-        }
 
-        // Extract clean DAG flows via BFS
-        while (extracted_total < target_flow - 1e-6) {
-            std::set<int> visited;
-            std::map<int, int> parent;
-            std::queue<int> q; 
+            bottleneck_capacities[source_node] = 1e9; 
+            bottleneck_pq.push({ 1e9, source_node });
 
-            q.push(src);
-            visited.insert(src);
+            bool path_found = false;
+            
+            while (!bottleneck_pq.empty()) {
+                auto [current_flow_limit, u] = bottleneck_pq.top();
+                bottleneck_pq.pop();
 
-            bool found_path = false;
-            while (!q.empty()) {
-                int u = q.front();
-                q.pop();
+                if (current_flow_limit < bottleneck_capacities[u]) continue;
 
-                if (u == des) {
-                    found_path = true;
+                if (u == target_node) {
+                    path_found = true;
                     break;
                 }
 
-                if (adj_list.find(u) != adj_list.end()) {
-                    for (const auto& out_edge : adj_list[u]) {
-                        int v = out_edge.first;
-                        if (raw_flow[{u, v}] > 1e-9 && visited.find(v) == visited.end()) {
-                            visited.insert(v);
-                            parent[v] = u;
-                            q.push(v);
+                for (const auto& edge_pair : raw_optimal_flow) {
+                    if (edge_pair.first.first == u && edge_pair.second > 1e-5) {
+                        int v = edge_pair.first.second;
+                        double edge_residual_capacity = edge_pair.second;
+
+                        double path_bottleneck = std::min(current_flow_limit, edge_residual_capacity);
+
+                        if (path_bottleneck > bottleneck_capacities[v]) {
+                            bottleneck_capacities[v] = path_bottleneck;
+                            traversal_parents[v] = u;
+                            bottleneck_pq.push({ path_bottleneck, v });
                         }
                     }
                 }
             }
 
-            if (!found_path) break; 
-
-            int curr = des;
-            std::vector<Link> current_path;
-            double min_flow = 1e9;
-
-            while (curr != src) {
-                int p = parent[curr];
-                Link lk = { p, curr };
-                current_path.push_back(lk);
-                min_flow = std::min(min_flow, raw_flow[lk]);
-                curr = p;
+            if (!path_found || bottleneck_capacities[target_node] < 1e-5) {
+                break;
             }
 
-            double extract_amount = std::min(min_flow, target_flow - extracted_total);
-            if (extract_amount < 1e-12) break;
+            int current_vertex = target_node;
+            std::vector<Link> extracted_route;
+            double extracted_bottleneck_flow = bottleneck_capacities[target_node];
 
-            for (const auto& lk : current_path) {
-                cleaned_flow[lk] += extract_amount;
-                raw_flow[lk] -= extract_amount;
+            while (current_vertex != source_node) {
+                int previous_vertex = traversal_parents[current_vertex];
+                Link current_link = { previous_vertex, current_vertex };
+                extracted_route.push_back(current_link);
+                current_vertex = previous_vertex;
             }
-            extracted_total += extract_amount;
-        }
 
-        best_flow_fractions[k] = cleaned_flow; 
-    }
+            all_extracted_paths.push_back({ extracted_route, extracted_bottleneck_flow });
+            total_extracted_volume += extracted_bottleneck_flow;
 
-    // Restore clean optimum
-    flow_fractions = best_flow_fractions;
-
-    // Rebuild Active Edge Set
-    E_active.clear();
-    double flow_threshold = 1e-6; 
-
-    for (size_t k = 0; k < traffic_demands.size(); ++k) {
-        for (auto it = flow_fractions[k].begin(); it != flow_fractions[k].end(); ) {
-            if (it->second < flow_threshold) {
-                it = flow_fractions[k].erase(it); 
-            } else {
-                E_active.insert(it->first); 
-                ++it;
+            // Deduct extracted flow from the residual network
+            for (const auto& lk : extracted_route) {
+                raw_optimal_flow[lk] -= extracted_bottleneck_flow;
             }
         }
+
+        // 3. Proportional Sorting and Top-K Truncation
+        std::map<Link, double> sanitized_flow_matrix;
+
+        if (!all_extracted_paths.empty()) {
+            std::sort(all_extracted_paths.begin(), all_extracted_paths.end(),
+                [](const ExtractedPath& a, const ExtractedPath& b) {
+                    return a.volume > b.volume;
+                });
+
+            double retained_volume = 0.0;
+            int retained_path_count = 0;
+            const int kMaxRetainedPaths = 5;
+            const double kTruncationThresholdRatio = 0.01; // Retain paths holding > 1% flow
+
+            for (std::size_t i = 0; i < all_extracted_paths.size(); ++i) {
+                const auto& path = all_extracted_paths[i];
+                double proportional_ratio = path.volume / (total_extracted_volume + 1e-15);
+
+                if ((proportional_ratio > kTruncationThresholdRatio && retained_path_count < kMaxRetainedPaths) || i == 0) {
+                    retained_volume += path.volume;
+                    retained_path_count++;
+                    for (const auto& lk : path.edges) {
+                        sanitized_flow_matrix[lk] += path.volume;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // 4. Multipath Flow Normalization (Scale up to exactly 100%)
+            if (retained_volume > 0.0) {
+                double normalization_scale = 1.0 / retained_volume;
+                for (auto& pair : sanitized_flow_matrix) {
+                    pair.second *= normalization_scale;
+                }
+            }
+        }
+
+        best_flow_routing_matrix[k] = sanitized_flow_matrix;
     }
 
-    std::cout << "E_active size (Cleaned): " << E_active.size() << std::endl;
+    // Restore the mathematically sanitized optimal routing matrix
+    flow_routing_matrix = best_flow_routing_matrix;
+
+    // Accurately reconstruct the active edge set from the cleansed telemetry
+    active_edges.clear();
+    for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+        for (const auto& pair : flow_routing_matrix[k]) {
+            if (pair.second > 1e-6) {
+                active_edges.insert(pair.first);
+            }
+        }
+    }
+
+    std::cout << "Active Network Edges (Post-Cleansing): " << active_edges.size() << "\n";
 }
