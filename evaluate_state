@@ -1,0 +1,147 @@
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <functional>
+#include <map>
+#include <tuple>
+#include <vector>
+
+#include "graph.h"
+// #include "solver_dual.h" // Uncomment if required by your broader translation unit
+// #include "ipm_solver.h"  // Uncomment if required by your broader translation unit
+
+/**
+ * @brief Evaluates the network state, computing system-wide delays and energy consumption.
+ *
+ * @param commodity_demands Traffic demand matrix specifying source, destination, and volume.
+ * @param flow_routing_matrix The computed flow routing matrix on active links.
+ * @param rate_capacities The physical rate capacities (Mbps) for all active links.
+ * @param power_allocations The transmission power allocations (Watts) for all active links.
+ * @param bandwidth_allocations The spectrum bandwidth allocations (MHz) for all active links.
+ * @param total_bandwidth_mhz The hard physical limit of total available spectrum in the system.
+ * @param num_nodes Total number of nodes in the graph (used for pre-allocating DFS structures).
+ * @return std::tuple<double, double, double, std::vector<double>>
+ * [Max End-to-End Delay, Max Expected Sum Delay, Total System Energy, Per-Commodity Max Delays]
+ *
+ * @note Implements a strict "Scale-Down Mechanism" to enforce physical bandwidth conservation, 
+ * penalizing over-allocated resources. End-to-end delays are computed using a cycle-immune 
+ * Depth-First Search (DFS) with memoization (O(V+E) per commodity) to extract the worst-case 
+ * traversal delay across multipath routing topologies.
+ */
+std::tuple<double, double, double, std::vector<double>> evaluate_network_state(
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& flow_routing_matrix,
+    const std::map<Link, double>& rate_capacities,
+    const std::map<Link, double>& power_allocations,
+    const std::map<Link, double>& bandwidth_allocations,
+    double total_bandwidth_mhz,
+    int num_nodes
+) {
+    double max_end_to_end_delay = 0.0;
+    double max_expected_sum_delay = 0.0;
+    double total_system_energy = 0.0;
+    std::vector<double> commodity_max_delays(commodity_demands.size(), 99999.0);
+
+    // =========================================================
+    // 1. Physical Conservation & Anti-Over-allocation Audit
+    // =========================================================
+    double total_allocated_bandwidth = 0.0;
+    for (const auto& pair : bandwidth_allocations) {
+        total_allocated_bandwidth += pair.second; 
+    }
+    
+    // Capacity scale down factor enforces the physical spectrum limit.
+    double capacity_scale_factor = (total_allocated_bandwidth > total_bandwidth_mhz) 
+                                   ? (total_bandwidth_mhz / std::max(total_allocated_bandwidth, 1e-9)) 
+                                   : 1.0;
+
+    // =========================================================
+    // 2. Core Evaluation Loop (Contiguous Memory Optimization)
+    // =========================================================
+    // Extracted allocations out of loop to avoid repetitive heap allocation overhead
+    std::vector<std::vector<std::pair<int, double>>> adjacency_list(num_nodes);
+    std::vector<double> delay_memoization(num_nodes, -2e8);
+    std::vector<bool> visited_nodes(num_nodes, false); 
+
+    for (std::size_t k = 0; k < commodity_demands.size(); ++k) {
+        double traffic_volume = std::get<2>(commodity_demands[k]);
+        int source_node = static_cast<int>(std::get<0>(commodity_demands[k]));
+        int target_node = static_cast<int>(std::get<1>(commodity_demands[k]));
+
+        // Reset subgraph structures for the current commodity (O(V))
+        for (int i = 0; i < num_nodes; ++i) {
+            adjacency_list[i].clear();
+            delay_memoization[i] = -2e8;
+        }
+        
+        double expected_sum_delay = 0.0;
+
+        // Construct localized adjacency list and accumulate exact energy metrics
+        for (const auto& pair : flow_routing_matrix[k]) {
+            if (pair.second > 1e-5) {
+                Link current_link = pair.first;
+                
+                // Apply the scale-down physical constraint
+                double scaled_rate_capacity = rate_capacities.count(current_link) 
+                                              ? (rate_capacities.at(current_link) * capacity_scale_factor) 
+                                              : 0.0;
+                scaled_rate_capacity = std::max(scaled_rate_capacity, 1e-9); // Zero-division protection
+
+                double allocated_power = power_allocations.count(current_link) 
+                                         ? power_allocations.at(current_link) 
+                                         : 0.0;
+
+                // Energy = Power * Time = Power * (Volume / Rate)
+                total_system_energy += (pair.second * traffic_volume) * (allocated_power / scaled_rate_capacity);
+
+                double link_transmission_delay = (pair.second * traffic_volume) / scaled_rate_capacity;
+                adjacency_list[current_link.first].emplace_back(current_link.second, link_transmission_delay);
+                expected_sum_delay += link_transmission_delay;
+            }
+        }
+
+        // =========================================================
+        // 3. Cycle-Immune DFS for Max Path Delay
+        // =========================================================
+        std::function<double(int)> get_main_path_delay = [&](int current_vertex) -> double {
+            if (current_vertex == target_node) return 0.0;
+            if (visited_nodes[current_vertex]) return -1e8; // Cycle detected: Return invalidation flag
+            if (delay_memoization[current_vertex] > -1e8) return delay_memoization[current_vertex]; // O(1) Cache hit
+
+            visited_nodes[current_vertex] = true;
+            double max_downstream_delay = -1e8;
+            bool cycle_hit = false;
+
+            for (const auto& edge : adjacency_list[current_vertex]) {
+                double downstream_delay = get_main_path_delay(edge.first);
+                if (downstream_delay == -1e8) {
+                    cycle_hit = true;
+                }
+                if (downstream_delay > -1e7) {
+                    max_downstream_delay = std::max(max_downstream_delay, edge.second + downstream_delay);
+                }
+            }
+            visited_nodes[current_vertex] = false;
+
+            // Protect memoization cache from being poisoned by cyclic dead-ends
+            if (!cycle_hit || max_downstream_delay > -1e7) {
+                delay_memoization[current_vertex] = max_downstream_delay;
+            }
+            return max_downstream_delay;
+        };
+
+        double worst_case_flow_delay = get_main_path_delay(source_node);
+        
+        if (worst_case_flow_delay > -1e7) {
+            max_end_to_end_delay = std::max(max_end_to_end_delay, worst_case_flow_delay);
+            max_expected_sum_delay = std::max(max_expected_sum_delay, expected_sum_delay);
+            commodity_max_delays[k] = worst_case_flow_delay;
+        } else {
+            max_end_to_end_delay = std::max(max_end_to_end_delay, 99999.0);
+            max_expected_sum_delay = std::max(max_expected_sum_delay, 99999.0);
+            commodity_max_delays[k] = 99999.0;
+        }
+    }
+    
+    return {max_end_to_end_delay, max_expected_sum_delay, total_system_energy, commodity_max_delays};
+}
