@@ -1,0 +1,68 @@
+#include <cstdio>
+#include <cstddef>
+#include <iostream>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include "graph.h"
+
+/**
+ * @brief Loads the multi-commodity traffic demand matrix from a CSV file.
+ * * @param file_path The absolute or relative path to the demand CSV file.
+ * @return std::vector<std::tuple<std::size_t, std::size_t, double>> A list of demands represented as (Source, Destination, Volume).
+ * * @note Utilizes low-level C-style file I/O (fopen_s, sscanf_s) to bypass potential 
+ * ABI incompatibilities between Debug/Release standard library implementations (e.g., std::ifstream). 
+ * Time complexity for parsing is O(L), where L is the number of lines in the file.
+ */
+std::vector<std::tuple<std::size_t, std::size_t, double>> Get_demand(const std::string& file_path) {
+    std::vector<std::tuple<std::size_t, std::size_t, double>> commodity_demands;
+
+    FILE* file_pointer = nullptr;
+    errno_t err = fopen_s(&file_pointer, file_path.c_str(), "r");
+
+    if (err != 0 || file_pointer == nullptr) {
+        std::cerr << "[Fatal Error] Failed to open commodity demand file: " << file_path 
+                  << ". Error Code: " << err << std::endl;
+        return commodity_demands;
+    }
+
+    char buffer[1024];
+
+    // Skip CSV header
+    if (!fgets(buffer, sizeof(buffer), file_pointer)) {
+        std::cerr << "[Warning] Commodity demand file is empty: " << file_path << std::endl;
+        fclose(file_pointer);
+        return commodity_demands;
+    }
+
+    while (fgets(buffer, sizeof(buffer), file_pointer)) {
+        // Pre-process: Convert CSV commas to spaces for sscanf consumption
+        for (int i = 0; buffer[i]; ++i) {
+            if (buffer[i] == ',') {
+                buffer[i] = ' ';
+            }
+        }
+
+        std::size_t source_node, target_node;
+        double traffic_volume;
+        int dummy_id; 
+
+        // Attempt format 1: [ID, Source, Target, Volume]
+        int parsed_count_with_id = sscanf_s(buffer, "%d %zu %zu %lf", &dummy_id, &source_node, &target_node, &traffic_volume);
+
+        if (parsed_count_with_id == 4) {
+            commodity_demands.emplace_back(source_node, target_node, traffic_volume);
+        } else {
+            // Attempt format 2: fallback for [Source, Target, Volume] without ID
+            int parsed_count_no_id = sscanf_s(buffer, "%zu %zu %lf", &source_node, &target_node, &traffic_volume);
+            if (parsed_count_no_id == 3) {
+                commodity_demands.emplace_back(source_node, target_node, traffic_volume);
+            }
+        }
+    }
+
+    fclose(file_pointer);
+
+    return commodity_demands;
+}
