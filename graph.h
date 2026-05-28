@@ -2,8 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdint>
+#include <cstddef>
 #include <cstdio>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -21,54 +22,54 @@
 #include <vector>
 
 // ==========================================
-// 1. Fundamental Types & Constants
+// 1. Core Types and Constants
 // ==========================================
 
 constexpr double kEpsilon = 1e-5;
 
-using WeightType = double;
-using GraphPath = std::vector<size_t>;
-using Link = std::pair<int, int>; 
+using weight_t = double;
+using GraphPath = std::vector<std::size_t>;
+using Link = std::pair<int, int>;
 using LinkMap = std::map<Link, double>;
-using FlowSolution = std::map<size_t, LinkMap>;
-using CostSolution = std::map<size_t, LinkMap>;
+using FlowSolution = std::map<std::size_t, LinkMap>;
+using CostSolution = std::map<std::size_t, LinkMap>;
 
 // ==========================================
 // 2. Data Structures
 // ==========================================
 
 /**
- * @brief Represents the initial resource allocation for the network.
+ * @brief Represents the initial resource allocation for the network model.
  */
 struct InitialAllocation {
     std::set<Link> active_edges;
-    LinkMap initial_powers;
-    LinkMap initial_bandwidths;
+    LinkMap initial_power;
+    LinkMap initial_bandwidth;
 };
 
 /**
- * @brief Captures the output of the Multi-Commodity Network Flow (MCNF) solver.
+ * @brief Multi-Commodity Network Flow (MCNF) optimization solution state.
  */
-struct McnfSolution {
-    FlowSolution flow_allocation;
+struct MCNFSolution {
+    FlowSolution flow_routing;
     LinkMap dual_variables;
-    bool is_successful = false;
+    bool success = false;
 };
 
 /**
- * @brief Results from the Subgradient optimization step.
+ * @brief Results from the subgradient descent optimization phase.
  */
 struct SubgradientResult {
-    FlowSolution optimal_flows;
-    std::vector<double> optimal_gammas;
-    std::vector<double> optimal_mus;
-    bool has_converged = false;
+    FlowSolution optimal_flow;
+    std::vector<double> optimal_gamma;
+    std::vector<double> optimal_mu;
+    bool converged;
 };
 
 /**
- * @brief Configuration parameters for the Frank-Wolfe optimization algorithm.
+ * @brief Configuration parameters for the Frank-Wolfe (Conditional Gradient) algorithm.
  */
-struct FrankWolfeConfig {
+struct FWConfig {
     double penalty_multiplier;
     double step_size_alpha;
     double convergence_tolerance;
@@ -77,42 +78,40 @@ struct FrankWolfeConfig {
 };
 
 // ==========================================
-// 3. Column Generation (Topology Reader)
+// 3. Data Loading Module (Col_gen)
 // ==========================================
 
 /**
- * @brief Handles graph topology parsing and memory allocation for adjacency matrices.
- * @note Instantiating this class performs an O(E) file parsing operation. Matrix 
- * allocation takes O(V^2) spatial complexity, bounded by a 5000-node safety threshold.
+ * @brief Network topology and delay data generator/loader.
+ * * Parses CSV-based network edge data and constructs the baseline 
+ * node properties and delay adjacency matrices.
  */
-class ColumnGenerator {
+class Col_gen {
 public:
-    std::vector<std::tuple<size_t, size_t, WeightType>> edge_list;
-    size_t num_nodes = 0;
-    std::vector<std::vector<WeightType>> delay_adjacency_matrix;
+    std::vector<std::tuple<std::size_t, std::size_t, weight_t>> edge_list;
+    std::size_t nodes_num = 0;
+    std::vector<std::vector<weight_t>> adjacency_matrix_dl;
 
     /**
-     * @brief Constructs the topology from a CSV data file.
-     * @param file_path Absolute or relative path to the topology CSV.
-     * @throws std::runtime_error If the file cannot be opened.
+     * @brief Constructs the column generator and loads topology from a file.
+     * @param file_path Absolute or relative path to the network topology CSV.
+     * @note File I/O utilizes low-level `fopen_s` for memory safety and strict POSIX compliance.
+     * Time complexity for graph construction is O(E), where E is the number of edges.
      */
-    explicit ColumnGenerator(const std::string& file_path) {
+    explicit Col_gen(const std::string& file_path) {
         FILE* file_pointer = nullptr;
-#ifdef _MSC_VER
         errno_t err = fopen_s(&file_pointer, file_path.c_str(), "r");
+
         if (err != 0 || file_pointer == nullptr) {
-            throw std::runtime_error("[ColumnGenerator] IO Error: Cannot open file.");
+            std::cerr << "[Fatal Error] Failed to open topology file. Code: " << err << std::endl;
+            exit(EXIT_FAILURE);
         }
-#else
-        file_pointer = fopen(file_path.c_str(), "r");
-        if (file_pointer == nullptr) {
-            throw std::runtime_error("[ColumnGenerator] IO Error: Cannot open file.");
-        }
-#endif
 
         char buffer[1024];
 
+        // Skip CSV header
         if (!fgets(buffer, sizeof(buffer), file_pointer)) {
+            std::cerr << "[Warning] Topology file is empty." << std::endl;
             fclose(file_pointer);
             return;
         }
@@ -125,247 +124,268 @@ public:
             }
 
             int dummy_id;
-            size_t source_node;
-            size_t target_node;
-            double delay_weight;
+            std::size_t source_node, target_node;
+            double link_delay;
 
-#ifdef _MSC_VER
-            int parsed_count = sscanf_s(buffer, "%d %zu %zu %lf", &dummy_id, &source_node, &target_node, &delay_weight);
-#else
-            int parsed_count = sscanf(buffer, "%d %zu %zu %lf", &dummy_id, &source_node, &target_node, &delay_weight);
-#endif
-
-            if (parsed_count < 4) {
+            int parsed_items = sscanf_s(buffer, "%d %zu %zu %lf", &dummy_id, &source_node, &target_node, &link_delay);
+            if (parsed_items < 4) {
                 continue;
             }
 
-            edge_list.emplace_back(source_node, target_node, delay_weight);
+            edge_list.emplace_back(source_node, target_node, link_delay);
 
-            num_nodes = std::max({num_nodes, source_node, target_node});
+            if (source_node > nodes_num) nodes_num = source_node;
+            if (target_node > nodes_num) nodes_num = target_node;
         }
 
         fclose(file_pointer);
 
         if (!edge_list.empty()) {
-            num_nodes++;
+            nodes_num++;
         }
 
-        if (num_nodes <= 5000) {
-            delay_adjacency_matrix.assign(num_nodes, std::vector<WeightType>(num_nodes, std::numeric_limits<WeightType>::max()));
+        if (nodes_num > 5000) {
+            std::cerr << "[Warning] Graph order (" << nodes_num << ") exceeds allocation safety threshold. Skipping dense matrix allocation." << std::endl;
+        } else {
+            adjacency_matrix_dl.assign(nodes_num, std::vector<weight_t>(nodes_num, std::numeric_limits<weight_t>::max()));
             for (const auto& edge : edge_list) {
-                size_t u = std::get<0>(edge);
-                size_t v = std::get<1>(edge);
-                if (u < num_nodes && v < num_nodes) {
-                    delay_adjacency_matrix[u][v] = std::get<2>(edge);
+                std::size_t u = std::get<0>(edge);
+                std::size_t v = std::get<1>(edge);
+                if (u < nodes_num && v < nodes_num) {
+                    adjacency_matrix_dl[u][v] = std::get<2>(edge);
                 }
             }
         }
     }
 
-    [[nodiscard]] size_t get_num_nodes() const { return num_nodes; }
+    [[nodiscard]] std::size_t get_nodes_num() const { return nodes_num; }
 };
 
 // ==========================================
-// 4. Graph Architecture
+// 4. Graph Topology Module
 // ==========================================
 
 /**
- * @brief Core graph representation utilizing an adjacency list.
+ * @brief Lightweight directed graph representation tailored for shortest-path routing algorithms.
  */
 class Graph {
 public:
-    std::vector<std::vector<std::pair<int, double>>> adjacency_list;
-    size_t num_nodes;
+    std::vector<std::vector<std::pair<int, double>>> adj;
+    std::size_t num_nodes;
 
     /**
-     * @brief Constructs the routing graph directly from the ColumnGenerator's edge list.
-     * @param total_nodes Upper bound of nodes to allocate for the adjacency list.
-     * @param col_gen Reference to the populated ColumnGenerator instance.
+     * @brief Constructs the directed graph from the parsed topology data.
+     * @param n Total number of vertices in the graph.
+     * @param G Constant reference to the loaded topology generator.
+     * @note Constructs adjacency lists in O(E) time to ensure efficient iterations during FW/BCD loops.
      */
-    Graph(size_t total_nodes, const ColumnGenerator& col_gen) : num_nodes(total_nodes), adjacency_list(total_nodes) {
-        for (const auto& edge : col_gen.edge_list) {
-            size_t u = std::get<0>(edge);
-            size_t v = std::get<1>(edge);
-            double weight = std::get<2>(edge);
+    Graph(std::size_t n, const Col_gen& G) : num_nodes(n), adj(n) {
+        for (const auto& edge : G.edge_list) {
+            std::size_t u = std::get<0>(edge);
+            std::size_t v = std::get<1>(edge);
+            double w = std::get<2>(edge);
 
-            if (u >= total_nodes || v >= total_nodes) {
+            if (u >= n || v >= n) {
+                std::cerr << "[Graph Error] Out-of-bounds edge detected: " << u << "->" << v << ". Max node index is " << n - 1 << ". Edge ignored." << std::endl;
                 continue;
             }
-            add_directed_edge(u, v, weight);
+            add_directed_edge(u, v, w);
         }
     }
 
-    /**
-     * @brief Inserts a directed edge into the adjacency list.
-     * @param u Source node index.
-     * @param v Destination node index.
-     * @param weight Edge weight (e.g., propagation delay).
-     */
-    void add_directed_edge(size_t u, size_t v, double weight) {
-        adjacency_list[u].emplace_back(static_cast<int>(v), weight);
+    void add_directed_edge(std::size_t u, std::size_t v, double weight) {
+        adj[u].emplace_back(static_cast<int>(v), weight);
     }
 
-    [[nodiscard]] size_t size() const { return num_nodes; }
+    [[nodiscard]] std::size_t size() const { return num_nodes; }
 };
 
 // ==========================================
-// 5. Core Algorithmic Declarations
+// 5. Core Mathematical Optimization API
 // ==========================================
 
-/**
- * @brief Parses the traffic demand matrix from disk.
- * @param file_path Path to the demand matrix data.
- * @return A vector of tuples containing (Source, Destination, Required_Bandwidth).
- */
-std::vector<std::tuple<size_t, size_t, double>> get_demand(const std::string& file_path);
+// --- Initialization & Utilities ---
 
-/**
- * @brief Initializes baseline network resources for mathematical optimization.
- * @param graph The underlying network topology.
- * @param subgraph_edges Active link subset to evaluate.
- * @param nodal_powers Initial transmit power distribution.
- * @param total_spectrum_bandwidth Total available spectrum block.
- * @return Struct containing the baseline active links, powers, and bandwidths.
- */
+std::vector<std::tuple<std::size_t, std::size_t, double>> Get_demand(const std::string& file_path);
+
 InitialAllocation initialize_resources(
     const Graph& graph,
-    const std::set<Link>& subgraph_edges,
-    const std::vector<double>& nodal_powers,
+    const std::set<Link>& active_subgraph,
+    const std::vector<double>& node_max_powers,
     double total_spectrum_bandwidth
 );
 
-/**
- * @brief Calculates Shannon capacity rates based on physical link parameters.
- * @note Time Complexity: O(|E|). Applies logarithmic capacity bound derivations.
- * @param graph The network topology.
- * @param num_nodes Total vertices.
- * @param active_edges Subset of links currently carrying traffic.
- * @param bandwidth_allocation Current bandwidth map.
- * @param power_allocation Current power distribution map.
- * @param noise_density_dbm Thermal noise density.
- * @param edge_size Number of active connections.
- * @param total_spectrum_bandwidth Global system bandwidth.
- * @param max_nodal_powers Vector of physical power limits per node.
- * @return A map of feasible transmission rates per active link.
- */
 LinkMap calculate_rates(
     const Graph& graph,
-    size_t num_nodes,
+    std::size_t num_nodes,
     const std::set<Link>& active_edges,
-    const LinkMap& bandwidth_allocation,
-    const LinkMap& power_allocation,
-    double noise_density_dbm,
-    size_t edge_size,
+    const LinkMap& bandwidth_allocations,
+    const LinkMap& power_allocations,
+    double noise_density_dbm_per_mhz,
+    std::size_t edge_size,
     double total_spectrum_bandwidth,
-    const std::vector<double>& max_nodal_powers
+    const std::vector<double>& node_max_powers
 );
 
+// --- Routing & Pathfinding (Shortest Path Subproblems) ---
+
 /**
- * @brief Executes standard Dijkstra's algorithm for baseline pathfinding.
- * @note Time Complexity: O(|E| + |V|log|V|). Uses a standard binary heap.
+ * @brief Standard Dijkstra's algorithm with optional node restrictions.
  * @param graph The network topology.
- * @param src Source node.
- * @param dest Destination node.
- * @param blocked_u Optional constraint to sever link (u,v).
- * @param blocked_v Optional constraint to sever link (u,v).
- * @param ignored_nodes Sub-graph node exclusion list.
- * @return A pair comprising the shortest path sequence and the cumulative path cost.
+ * @param src Source node index.
+ * @param dest Destination node index.
+ * @param blocked_u Optional constraint to block a specific source link node.
+ * @param blocked_v Optional constraint to block a specific target link node.
+ * @param ignored_nodes Optional list of nodes to strictly avoid during routing.
+ * @return A tuple containing the optimal path and its scalar cost.
+ * @note Time Complexity: O((V + E) log V). Forms the linear subproblem oracle for the Frank-Wolfe loop.
  */
 std::pair<GraphPath, double> dijkstra(
     const Graph& graph,
-    size_t src,
-    size_t dest,
-    size_t blocked_u = std::numeric_limits<size_t>::max(),
-    size_t blocked_v = std::numeric_limits<size_t>::max(),
-    const std::vector<size_t>& ignored_nodes = {}
+    std::size_t src,
+    std::size_t dest,
+    std::size_t blocked_u = std::numeric_limits<std::size_t>::max(),
+    std::size_t blocked_v = std::numeric_limits<std::size_t>::max(),
+    const std::vector<std::size_t>& ignored_nodes = {}
 );
 
-/**
- * @brief Dijkstra's algorithm override supporting dynamically injected weights.
- */
 std::pair<GraphPath, double> dijkstra(
     const Graph& graph,
-    size_t src,
-    size_t dest,
+    std::size_t src,
+    std::size_t dest,
     const std::map<Link, double>& dynamic_weights
 );
 
-/**
- * @brief Computes Yen's K-Shortest Paths.
- * @note Used predominantly for path dictionary initialization prior to Flow optimizations.
- * @param k Number of target paths.
- * @param core_path Initial seed path.
- * @param num_iterations Depth of deviation tracking.
- * @param col_gen Column generation data reference.
- * @param graph Target topology.
- * @param src Source vertex.
- * @return Vector of valid GraphPaths.
- */
 std::vector<GraphPath> k_shortest_paths(
-    size_t k,
-    const GraphPath& core_path,
-    size_t num_iterations,
-    const ColumnGenerator& col_gen,
+    std::size_t k,
+    const GraphPath& target_path,
+    std::size_t num_paths,
+    const Col_gen& topology_data,
     const Graph& graph,
-    size_t src
+    std::size_t src
 );
 
-/**
- * @brief Robust, weighted Dijkstra explicitly mapped for Frank-Wolfe subproblems.
- * @param graph Target topology.
- * @param num_nodes Total system vertices.
- * @param src Source node.
- * @param dst Destination node.
- * @param weights Dynamic, iteration-specific gradient link weights.
- * @return Sequence of traversed links representing the shortest path.
- */
 std::vector<Link> dijkstra_weighted(
     const Graph& graph,
-    size_t num_nodes,
+    std::size_t num_nodes,
     int src,
     int dst,
-    const std::map<Link, double>& weights
+    const std::map<Link, double>& penalized_weights
+);
+
+// --- Evaluation & Solvers ---
+
+std::tuple<double, double, double, std::vector<double>> evaluate_network_state(
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& flow_routing_matrix,
+    const std::map<Link, double>& rate_capacities,
+    const std::map<Link, double>& power_allocations,
+    const std::map<Link, double>& bandwidth_allocations,
+    double total_bandwidth,
+    int num_nodes
+);
+
+void export_commodity_path_details(
+    const std::string& file_path,
+    const std::string& algo_name,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    const std::vector<std::map<Link, double>>& flow_routing_matrix,
+    const std::map<Link, double>& rate_capacities,
+    const std::map<Link, double>& power_allocations,
+    const std::map<Link, double>& bandwidth_allocations,
+    double total_bandwidth
 );
 
 /**
- * @brief Solves the multi-commodity routing problem via the Frank-Wolfe algorithm.
- * @note Time Complexity: O(K * (|E| + |V|log|V|)) per iteration. 
- * Converges at a rate of O(1/k) to the optimal fractional flow boundary.
- * @param graph Fixed network topology.
- * @param edge_list Structural edge definitions.
- * @param num_nodes Total vertices.
+ * @brief Executes the Frank-Wolfe (Conditional Gradient) algorithm for network routing optimization.
+ * @param graph Underlying graph topology.
+ * @param edge_list Master list of network edges.
+ * @param num_nodes Total vertices in the graph.
  * @param active_edges Subset of operational links.
- * @param demand_data Traffic matrices mapping source to destination loads.
- * @param initial_rates Pre-calculated Shannon capacities.
- * @param initial_powers Pre-calculated nodal power states.
- * @param flow_solution [Out] Matrix capturing converged link flows.
- * @param config Frank-Wolfe hyper-parameters (alpha, epsilon, max_iter).
- * @param dynamic_edge_weights Iteration-specific external weight perturbations.
+ * @param commodity_demands Source-destination traffic matrix.
+ * @param initial_rates Baseline capacities of the active edges.
+ * @param initial_power Baseline power allocation.
+ * @param flow_routing_matrix (In/Out) The decision variables for traffic flow on links.
+ * @param config Hyperparameters guiding step size and convergence.
+ * @param dynamic_edge_weights Real-time penalties/costs for the linear shortest-path subproblem.
+ * @note Computes the descent direction by minimizing the linearized objective (via `dijkstra_weighted`). 
+ * Updates the flow routing matrix via a convex combination of the current state and the subproblem solution. 
+ * Algorithm converges asymptotically at a rate of O(1/k).
  */
 void solve_frank_wolfe(
     const Graph& graph,
-    const std::vector<std::tuple<size_t, size_t, double>>& edge_list,
-    size_t num_nodes,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& edge_list,
+    std::size_t num_nodes,
     std::set<Link>& active_edges,
-    const std::vector<std::tuple<size_t, size_t, double>>& demand_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
     const LinkMap& initial_rates,
-    const LinkMap& initial_powers,
-    std::vector<std::map<Link, double>>& flow_solution,
-    FrankWolfeConfig config,
+    const LinkMap& initial_power,
+    std::vector<std::map<Link, double>>& flow_routing_matrix,
+    FWConfig config,
     const std::map<Link, double>& dynamic_edge_weights = {}
 );
 
-/**
- * @brief Computes the Euclidean (L2) norm difference between two state vectors.
- * @param a First numerical state vector.
- * @param b Second numerical state vector.
- * @return The scalar L2 distance.
- */
-inline double calculate_l2_norm(const std::vector<double>& a, const std::vector<double>& b) {
-    double sum_squared = 0.0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        double difference = a[i] - b[i];
-        sum_squared += difference * difference;
+inline double calculate_l2_norm(const std::vector<double>& vector_a, const std::vector<double>& vector_b) {
+    double sum_sq = 0.0;
+    for (std::size_t i = 0; i < vector_a.size(); ++i) {
+        double diff = vector_a[i] - vector_b[i];
+        sum_sq += diff * diff;
     }
-    return std::sqrt(sum_squared);
+    return std::sqrt(sum_sq);
 }
+
+// --- Initialization Packagers ---
+
+/**
+ * @brief Container packaging all initial states before entering the optimization loops.
+ */
+struct InitializationResult {
+    std::vector<std::map<Link, double>> flow_routing_matrix;     
+    std::vector<std::map<Link, double>> initial_ksp_routing; 
+    std::set<Link> active_edges;                                  
+    LinkMap initial_power;                                         
+    LinkMap initial_bandwidth;                                     
+    LinkMap initial_rate_capacity;                                 
+};
+
+InitializationResult initialize_with_ksp_uniform(
+    const Graph& graph, 
+    Col_gen topology_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes, 
+    double max_power_per_node, 
+    double total_spectrum_bandwidth, 
+    double noise_density_dbm_per_mhz
+);
+
+InitializationResult initialize_with_ksp_warm(
+    const Graph& graph, 
+    Col_gen topology_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes, 
+    double max_power_per_node, 
+    double user_alpha, 
+    double total_spectrum_bandwidth, 
+    double noise_density_dbm_per_mhz
+);
+
+InitializationResult initialize_with_ksp_game(
+    const Graph& graph, 
+    const Col_gen& topology_data, 
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes, 
+    double max_power_per_node, 
+    double user_alpha, 
+    double total_spectrum_bandwidth, 
+    double noise_density_dbm_per_mhz
+);
+
+InitializationResult initialize_with_ggb_warm_start(
+    const Graph& graph, 
+    Col_gen topology_data,
+    const std::vector<std::tuple<std::size_t, std::size_t, double>>& commodity_demands,
+    int num_nodes, 
+    double max_power_per_node, 
+    double total_spectrum_bandwidth, 
+    double noise_density_dbm_per_mhz
+);
