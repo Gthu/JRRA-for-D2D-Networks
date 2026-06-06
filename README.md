@@ -1,10 +1,10 @@
 # JRRA-for-D2D-Networks
 
-**Official C++ Implementation for the Journal Paper:** *"Block coordinate descent for joint delay-energy optimization in multi-hop D2D networks"*
+**Official C++ Implementation for the Research Paper:** *"Block coordinate descent for joint delay-energy optimization in multi-hop D2D networks"*
 
 This repository contains an industrial-grade, high-performance C++ optimization engine designed for Joint Routing and Resource Allocation (JRRA) in Device-to-Device (D2D) networks. The core solver relies on the Block Coordinate Descent (BCD) framework to efficiently decouple and solve complex, multi-constraint mathematical models.
 
-The engine features a suite of advanced mathematical solvers, including the **Frank-Wolfe (FW) algorithm**, **Lagrangian Dual Decomposition (LDD)**, a **Game-Theoretic Greedy Baseline (GGB)**, and a highly optimized **Primal-Dual Interior Point Method (IPM)** utilizing block-decoupled Sherman-Morrison Hessian inversions.
+The engine features a suite of advanced mathematical solvers, including the **Frank-Wolfe (FW) algorithm**, **Lagrangian Dual Decomposition (LDD)**, a **Game-Greedy Baseline (GGB)**, and a highly optimized **Primal-Dual Interior Point Method (IPM)** utilizing block-decoupled Sherman-Morrison Hessian inversions.
 
 ## Key Engineering Features
 
